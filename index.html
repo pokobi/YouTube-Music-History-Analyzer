@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Music History Analyzer</title>
+    <meta name="description" content="YouTube Musicの再生履歴を分析・可視化するツール">
+    
+    <!-- ファビコン (YouTube Music風の赤い再生ボタン) -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22><circle cx=%2212%22 cy=%2212%22 r=%2210%22 fill=%22%23dc2626%22/><polygon points=%2210 8 16 12 10 16 10 8%22 fill=%22white%22/></svg>">
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <!-- 自作CSS -->
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-gray-900 text-gray-100 font-sans selection:bg-red-500 selection:text-white pb-12 overflow-y-scroll">
+
+    <!-- アプリケーション全体 -->
+    <div id="app" class="min-h-screen flex flex-col">
+        
+        <!-- ヘッダー (固定) -->
+        <div id="header-container" class="sticky top-0 z-40 w-full"></div>
+        
+        <!-- メインコンテンツ (スクロール可) -->
+        <main id="main-container" class="flex-1 max-w-7xl mx-auto px-4 py-8 w-full"></main>
+        
+        <!-- モーダル (オーバーレイ) -->
+        <div id="modal-container" class="relative z-50"></div>
+
+        <!-- トップへ戻るボタン -->
+        <div id="scroll-btn-container"></div>
+        
+        <!-- トースト通知用コンテナ -->
+        <div id="toast-container" class="fixed bottom-4 left-1/2 transform -translate-x-1/2 z-50 pointer-events-none"></div>
+    </div>
+
+    <!-- ロジック -->
+    <script src="script.js"></script>
+</body>
+</html>
