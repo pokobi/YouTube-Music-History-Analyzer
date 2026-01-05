@@ -1,3 +1,5 @@
+# https://pokobi.github.io/YouTube-Music-History-Analyzer/
+
 # **YouTube Music History Analyzer**
 
 YouTube Musicの再生履歴データ (watch-history.json) を読み込み、あなたの音楽の趣向を詳細に分析・可視化するツールです。
