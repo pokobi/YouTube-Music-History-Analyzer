@@ -1,0 +1,71 @@
+/* ベーススタイル */
+:root {
+    color-scheme: dark;
+}
+
+body {
+    background-color: #111827;
+    color: #f3f4f6;
+}
+
+/* --- カスタムスクロールバー --- */
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1f2937;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+    background-color: #4b5563;
+    border-radius: 5px;
+    border: 2px solid #1f2937;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background-color: #6b7280;
+}
+
+.custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: #4b5563 #1f2937;
+}
+
+/* アニメーション定義 */
+@keyframes fade-in-up {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in-up { animation: fade-in-up 0.4s ease-out forwards; }
+
+@keyframes zoom-in {
+    from { opacity: 0; transform: scale(0.95); }
+    to { opacity: 1; transform: scale(1); }
+}
+.animate-zoom-in { animation: zoom-in 0.3s ease-out forwards; }
+
+@keyframes modal-in {
+    from { opacity: 0; transform: scale(0.95) translateY(10px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+.animate-modal-in { animation: modal-in 0.2s ease-out forwards; }
+
+@keyframes slide-up {
+    from { opacity: 0; transform: translate(-50%, 20px); }
+    to { opacity: 1; transform: translate(-50%, 0); }
+}
+.animate-toast { animation: slide-up 0.3s ease-out forwards; }
+
+/* 詳細ガイドのアコーディオン用スタイル */
+details > summary {
+    list-style: none;
+}
+details > summary::-webkit-details-marker {
+    display: none;
+}
+details[open] summary ~ * {
+    animation: fade-in-up 0.3s ease-out;
+}
