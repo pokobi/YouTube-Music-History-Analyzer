@@ -292,7 +292,6 @@ function readFileAsText(file) {
 
 // 複数ファイル入力および追加マージハンドラ
 async function handleFiles(files) {
-    // 【バグ修正】イベントの二重発火（ドラッグ＆ドロップ時など）をブロックして履歴の二重生成を防ぐ
     if (state.loading) return; 
     if (!files || files.length === 0) return;
 
@@ -360,7 +359,7 @@ async function handleFiles(files) {
         // 日付の新しい順に並び替え
         mergedData.sort((a, b) => b.date - a.date);
 
-        // 【バグ修正】全く新しいデータが追加されなかった場合は保存処理をスキップする
+        // 全く新しいデータが追加されなかった場合は保存処理をスキップする
         const isNoNewData = (mergedData.length === baseDataLength && baseDataLength > 0);
         if (isNoNewData) {
             showToast("新しいデータは追加されませんでした（既存データと重複）");
@@ -687,14 +686,18 @@ function closeModal() {
 // 1. ヘッダー描画
 function renderHeader() {
     const container = document.getElementById('header-container');
+    
+    // 【変更箇所】
+    // スマホ時はrelative（追従しない）、PC・タブレット(md以上)時はsticky（上部固定）にするよう変更。
+    // さらにパディングなどを細かく調整し、スマホでも余計なスペースを取らないようにしました。
     const headerHTML = `
-        <header class="border-b border-gray-800 bg-gray-900/50 backdrop-blur-md sticky top-0 z-50">
-            <div class="max-w-7xl mx-auto px-4 py-4 flex flex-col sm:flex-row items-center justify-between gap-4">
-                <div class="flex items-center space-x-3 cursor-pointer group" onclick="location.reload()">
-                    <div class="bg-gradient-to-br from-red-600 to-red-700 p-2 rounded-xl shadow-lg shadow-red-900/20 group-hover:scale-105 transition-transform">
-                        <i data-lucide="music" class="text-white"></i>
+        <header class="border-b border-gray-800 bg-gray-900/50 backdrop-blur-md relative md:sticky md:top-0 z-50">
+            <div class="max-w-7xl mx-auto px-4 py-3 md:py-4 flex flex-col md:flex-row items-center justify-between gap-3 md:gap-4">
+                <div class="flex items-center space-x-3 cursor-pointer group w-full md:w-auto justify-center md:justify-start" onclick="location.reload()">
+                    <div class="bg-gradient-to-br from-red-600 to-red-700 p-2 rounded-xl shadow-lg shadow-red-900/20 group-hover:scale-105 transition-transform flex-shrink-0">
+                        <i data-lucide="music" class="text-white w-5 h-5 md:w-6 md:h-6"></i>
                     </div>
-                    <h1 class="text-xl font-bold tracking-tight group-hover:text-red-400 transition-colors">YouTube Music History Analyzer</h1>
+                    <h1 class="text-lg md:text-xl font-bold tracking-tight group-hover:text-red-400 transition-colors truncate">YouTube Music Analyzer</h1>
                 </div>
                 ${state.stats ? renderControls() : ''}
             </div>
@@ -819,41 +822,45 @@ function renderControls() {
 
     const today = getTodayString();
 
+    // 【変更箇所】
+    // スマホ画面でUIが縦に長くなりすぎないように、flex-wrapを使いつつボタン等のサイズをコンパクトにしました
     return `
-        <div class="flex flex-col sm:flex-row items-center gap-3">
-            <div class="relative group">
-                <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                    <i data-lucide="filter" class="w-4 h-4 text-gray-400"></i>
+        <div class="flex flex-col xl:flex-row items-center gap-3 w-full md:w-auto mt-1 md:mt-0">
+            <div class="flex flex-wrap justify-center items-center gap-2 w-full md:w-auto">
+                <div class="relative group flex-shrink-0">
+                    <div class="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none">
+                        <i data-lucide="filter" class="w-3.5 h-3.5 text-gray-400"></i>
+                    </div>
+                    <select id="yearSelect" class="bg-gray-800 border border-gray-700 text-white text-xs md:text-sm rounded-lg focus:ring-red-500 focus:border-red-500 block w-28 md:w-32 pl-8 p-1.5 md:p-2 appearance-none cursor-pointer hover:bg-gray-750 transition-colors">
+                        <option value="All" ${state.filter.year === 'All' ? 'selected' : ''}>全期間</option>
+                        ${yearOptions}
+                        <option value="Custom" ${state.filter.year === 'Custom' ? 'selected' : ''} disabled>カスタム</option>
+                    </select>
                 </div>
-                <select id="yearSelect" class="bg-gray-800 border border-gray-700 text-white text-sm rounded-lg focus:ring-red-500 focus:border-red-500 block w-32 pl-9 p-2 appearance-none cursor-pointer hover:bg-gray-750 transition-colors">
-                    <option value="All" ${state.filter.year === 'All' ? 'selected' : ''}>全期間</option>
-                    ${yearOptions}
-                    <option value="Custom" ${state.filter.year === 'Custom' ? 'selected' : ''} disabled>カスタム</option>
-                </select>
+
+                <div class="flex items-center gap-1.5 bg-gray-800 border border-gray-700 rounded-lg p-1 px-2 flex-shrink-0">
+                    <input type="date" id="startDate" value="${state.filter.startDate}" max="${today}" class="bg-transparent text-white text-xs md:text-sm focus:outline-none [color-scheme:dark] w-[110px] md:w-auto">
+                    <span class="text-gray-500 text-xs md:text-sm">〜</span>
+                    <input type="date" id="endDate" value="${state.filter.endDate}" max="${today}" class="bg-transparent text-white text-xs md:text-sm focus:outline-none [color-scheme:dark] w-[110px] md:w-auto">
+                </div>
             </div>
 
-            <div class="flex items-center gap-2 bg-gray-800 border border-gray-700 rounded-lg p-1 px-3">
-                <input type="date" id="startDate" value="${state.filter.startDate}" max="${today}" class="bg-transparent text-white text-sm focus:outline-none [color-scheme:dark]">
-                <span class="text-gray-500 text-sm">〜</span>
-                <input type="date" id="endDate" value="${state.filter.endDate}" max="${today}" class="bg-transparent text-white text-sm focus:outline-none [color-scheme:dark]">
-            </div>
-
-            <div class="flex items-center gap-2">
-                <button id="backupBtn" class="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-2 rounded-lg transition-colors flex items-center gap-2 border border-gray-700" title="JSONバックアップ">
-                    <i data-lucide="save" class="w-4 h-4"></i>
+            <div class="flex items-center justify-center gap-2 flex-wrap w-full md:w-auto">
+                <button id="backupBtn" class="text-xs md:text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-2.5 md:px-3 py-1.5 md:py-2 rounded-lg transition-colors flex items-center gap-1.5 border border-gray-700" title="JSONバックアップ">
+                    <i data-lucide="save" class="w-3.5 h-3.5 md:w-4 md:h-4"></i>
                 </button>
-                <button id="downloadBtn" class="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-2 rounded-lg transition-colors flex items-center gap-2 border border-gray-700" title="CSV保存">
-                    <i data-lucide="download" class="w-4 h-4"></i>
+                <button id="downloadBtn" class="text-xs md:text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-2.5 md:px-3 py-1.5 md:py-2 rounded-lg transition-colors flex items-center gap-1.5 border border-gray-700" title="CSV保存">
+                    <i data-lucide="download" class="w-3.5 h-3.5 md:w-4 md:h-4"></i>
                 </button>
                 
-                <div class="w-px h-6 bg-gray-700 mx-1"></div>
+                <div class="w-px h-5 bg-gray-700 mx-0.5"></div>
                 
-                <button id="addFileBtn" class="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-2 rounded-lg transition-colors flex items-center gap-2 border border-gray-700" title="別の履歴ファイルを追加してマージ">
-                    <i data-lucide="plus" class="w-4 h-4"></i>
+                <button id="addFileBtn" class="text-xs md:text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-2.5 md:px-3 py-1.5 md:py-2 rounded-lg transition-colors flex items-center gap-1.5 border border-gray-700" title="別の履歴ファイルを追加してマージ">
+                    <i data-lucide="plus" class="w-3.5 h-3.5 md:w-4 md:h-4"></i>
                     <span class="hidden sm:inline">追加</span>
                 </button>
-                <button id="resetBtn" class="text-sm bg-gray-800 hover:bg-red-900/50 text-gray-300 hover:text-red-400 px-3 py-2 rounded-lg transition-colors flex items-center gap-2 border border-gray-700" title="現在のデータをクリアしてトップに戻る">
-                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                <button id="resetBtn" class="text-xs md:text-sm bg-gray-800 hover:bg-red-900/50 text-gray-300 hover:text-red-400 px-2.5 md:px-3 py-1.5 md:py-2 rounded-lg transition-colors flex items-center gap-1.5 border border-gray-700" title="現在のデータをクリアしてトップに戻る">
+                    <i data-lucide="trash-2" class="w-3.5 h-3.5 md:w-4 md:h-4"></i>
                 </button>
                 
                 <input type="file" id="headerFileInput" multiple accept=".json" class="hidden">
