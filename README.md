@@ -1,5 +1,7 @@
 # YouTube Music History Analyzer
 
+## [https://pokobi.github.io/YouTube-Music-History-Analyzer/](https://pokobi.github.io/YouTube-Music-History-Analyzer/)
+
 YouTube Musicの再生履歴データ（watch-history.json）をブラウザ上で解析し、再生傾向や統計情報を表示するためのツールです。
 
 ## 機能について
