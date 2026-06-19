@@ -223,7 +223,6 @@ function showToast(message) {
 // ハイライト用ヘルパー
 function highlightText(text) {
     if (!state.searchTerm || !text) return text;
-    // HTMLタグをエスケープしてから置換
     const escapedText = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const regex = new RegExp(`(${state.searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
     return escapedText.replace(regex, '<span class="bg-yellow-500/30 text-yellow-200 font-bold">$1</span>');
@@ -250,7 +249,7 @@ function highlightText(text) {
             }
         });
 
-        // コピーボタンのイベント委譲（document全体で監視）
+        // コピーボタンのイベント委譲
         document.addEventListener('click', (e) => {
             const btn = e.target.closest('.copy-btn');
             if (btn) {
@@ -260,39 +259,147 @@ function highlightText(text) {
             }
         });
 
+        // ダッシュボード表示時などのグローバルなドラッグ＆ドロップ（追加マージ用）
+        document.addEventListener('dragover', (e) => {
+            e.preventDefault();
+        });
+        document.addEventListener('drop', (e) => {
+            e.preventDefault();
+            if (document.getElementById('dropZone')) return;
+            
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                const hasJson = Array.from(e.dataTransfer.files).some(f => f.name.endsWith('.json'));
+                if (hasJson) {
+                    handleFiles(e.dataTransfer.files);
+                }
+            }
+        });
+
     } catch (e) {
         console.error("Init Failed", e);
     }
 })();
 
-// ファイル入力ハンドラ
-function handleFile(file) {
-    if (!file) return;
+// FileReaderをPromise化
+function readFileAsText(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(file);
+    });
+}
+
+// 複数ファイル入力および追加マージハンドラ
+async function handleFiles(files) {
+    // 【バグ修正】イベントの二重発火（ドラッグ＆ドロップ時など）をブロックして履歴の二重生成を防ぐ
+    if (state.loading) return; 
+    if (!files || files.length === 0) return;
 
     state.loading = true;
     state.error = null;
-    renderMain(); 
+    renderMain();
 
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-        try {
-            const json = JSON.parse(e.target.result);
+    try {
+        let allProcessedData = [];
+        let baseDataLength = 0;
+        
+        if (state.rawData && state.rawData.length > 0) {
+            allProcessedData = allProcessedData.concat(state.rawData);
+            baseDataLength = state.rawData.length;
+        } else if (state.historyList && state.historyList.length > 0) {
+            // 過去の履歴をマージベースとして全て読み込む
+            for (const hist of state.historyList) {
+                const record = await loadHistoryData(hist.id);
+                if (record && record.data) {
+                    const restoredData = record.data.map(item => {
+                        const date = new Date(item.d);
+                        return {
+                            title: item.t,
+                            artist: item.a,
+                            url: item.u,
+                            artistUrl: item.au,
+                            date: date,
+                            year: date.getFullYear(),
+                            hour: date.getHours(),
+                            monthKey: `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}`,
+                            dayKey: `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`,
+                            dayValue: new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime(),
+                            videoId: extractVideoId(item.u),
+                            channelId: item.au ? extractChannelId(item.au) : null
+                        };
+                    });
+                    allProcessedData = allProcessedData.concat(restoredData);
+                }
+            }
+            baseDataLength = allProcessedData.length;
+        }
+
+        // 新しいファイルを追加
+        for (const file of Array.from(files)) {
+            if (!file.name.endsWith('.json')) continue;
+            const text = await readFileAsText(file);
+            const json = JSON.parse(text);
             const processed = parseRawJSON(json);
-            
-            await saveHistoryToDB(file.name, processed);
-            await loadHistoryList(); 
+            allProcessedData = allProcessedData.concat(processed);
+        }
 
-            state.rawData = processed;
+        if (allProcessedData.length === 0) {
+            throw new Error("有効なYouTube履歴データが見つかりませんでした。");
+        }
+
+        // 再生日時と楽曲識別情報で重複を排除
+        const seen = new Set();
+        const mergedData = allProcessedData.filter(item => {
+            const uniqueKey = `${item.date.getTime()}_${item.videoId || (item.title + '_' + item.artist)}`;
+            if (seen.has(uniqueKey)) return false;
+            seen.add(uniqueKey);
+            return true;
+        });
+
+        // 日付の新しい順に並び替え
+        mergedData.sort((a, b) => b.date - a.date);
+
+        // 【バグ修正】全く新しいデータが追加されなかった場合は保存処理をスキップする
+        const isNoNewData = (mergedData.length === baseDataLength && baseDataLength > 0);
+        if (isNoNewData) {
+            showToast("新しいデータは追加されませんでした（既存データと重複）");
+            state.rawData = mergedData;
             resetFilters();
             calculateStats();
-
-        } catch (err) {
-            state.error = "JSONファイルの読み込みに失敗しました。";
-            state.loading = false;
-            renderMain();
+            return;
         }
-    };
-    reader.readAsText(file);
+
+        // 保存用のファイル名を決定
+        let saveFilename = '';
+        if (files.length === 1 && (!state.rawData || state.rawData.length === 0) && state.historyList.length === 0) {
+            saveFilename = files[0].name;
+        } else {
+            saveFilename = `Merged_History_${new Date().toISOString().slice(0, 10)}`;
+        }
+
+        // 先に新しいマージデータを保存する
+        await saveHistoryToDB(saveFilename, mergedData);
+
+        // 自動マージが走った場合、履歴リストが冗長になるのを防ぐため過去の細かな履歴は整理（削除）する
+        if (state.historyList && state.historyList.length > 0 && !state.rawData) {
+            for (const hist of state.historyList) {
+                await deleteHistory(hist.id);
+            }
+        }
+
+        await loadHistoryList(); 
+
+        state.rawData = mergedData;
+        resetFilters();
+        calculateStats();
+
+    } catch (err) {
+        console.error(err);
+        state.error = "ファイルの読み込みまたはマージ処理に失敗しました。データが正しいJSON形式か確認してください。";
+        state.loading = false;
+        renderMain();
+    }
 }
 
 // 履歴からのロードハンドラ
@@ -738,9 +845,18 @@ function renderControls() {
                 <button id="downloadBtn" class="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-2 rounded-lg transition-colors flex items-center gap-2 border border-gray-700" title="CSV保存">
                     <i data-lucide="download" class="w-4 h-4"></i>
                 </button>
-                <button id="resetBtn" class="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-2 rounded-lg transition-colors flex items-center gap-2 border border-gray-700" title="別のファイルを読み込む">
-                    <i data-lucide="file-text" class="w-4 h-4"></i>
+                
+                <div class="w-px h-6 bg-gray-700 mx-1"></div>
+                
+                <button id="addFileBtn" class="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-3 py-2 rounded-lg transition-colors flex items-center gap-2 border border-gray-700" title="別の履歴ファイルを追加してマージ">
+                    <i data-lucide="plus" class="w-4 h-4"></i>
+                    <span class="hidden sm:inline">追加</span>
                 </button>
+                <button id="resetBtn" class="text-sm bg-gray-800 hover:bg-red-900/50 text-gray-300 hover:text-red-400 px-3 py-2 rounded-lg transition-colors flex items-center gap-2 border border-gray-700" title="現在のデータをクリアしてトップに戻る">
+                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                </button>
+                
+                <input type="file" id="headerFileInput" multiple accept=".json" class="hidden">
             </div>
         </div>
     `;
@@ -797,7 +913,7 @@ function renderUploadScreen() {
             <div class="mt-12 w-full max-w-2xl animate-fade-in-up">
                 <h3 class="text-lg font-bold text-white mb-4 flex items-center gap-2">
                     <i data-lucide="clock" class="text-blue-500"></i>
-                    履歴からロード
+                    履歴一覧 (ワンクリックで再ロード)
                 </h3>
                 <div class="space-y-3">
                     ${historyItems}
@@ -810,14 +926,15 @@ function renderUploadScreen() {
         <div class="flex flex-col items-center">
             <div class="max-w-2xl w-full mt-8 animate-zoom-in">
                 <div id="dropZone" class="relative border-2 border-dashed rounded-3xl p-12 text-center transition-all duration-300 flex flex-col items-center justify-center min-h-[300px] group ${state.dragActive ? 'border-red-500 bg-red-500/10 scale-105 shadow-2xl shadow-red-900/20' : 'border-gray-700 bg-gray-800/30 hover:border-gray-500 hover:bg-gray-800/50'}">
-                    <input type="file" id="fileInput" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" accept=".json" />
+                    <input type="file" id="fileInput" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" accept=".json" multiple />
                     
                     <div class="bg-gray-800 p-6 rounded-2xl mb-6 shadow-xl group-hover:scale-110 transition-transform duration-300">
                         <i data-lucide="upload" class="w-12 h-12 text-red-500"></i>
                     </div>
                     <h2 class="text-2xl font-bold mb-3 bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400">watch-history.json をドロップ</h2>
                     <p class="text-gray-400 mb-6 text-sm leading-relaxed">
-                        Google Takeoutのファイルを選択。<br/>データはブラウザ内に自動保存されます。
+                        Google Takeoutのファイルを選択（複数選択可）。データはブラウザ内に自動保存されます。<br/>
+                        ※複数のファイルを同時に読み込んだり、後から追加で読み込ませてデータを統合（マージ）することが可能です。期間が重複しているデータは自動で判別され、除外されます。
                     </p>
                     <button class="bg-red-600 hover:bg-red-700 text-white font-medium py-3 px-8 rounded-full transition-all shadow-lg shadow-red-900/30 hover:shadow-red-900/50 active:scale-95 pointer-events-none">ファイルを選択</button>
                     ${errorHTML}
@@ -867,7 +984,6 @@ function renderDashboard() {
     const searchLower = state.searchTerm.toLowerCase();
     
     // 初期表示用のフィルタリング
-    // ※入力時の再描画ではDOMを直接更新するため、この変数は初期描画用
     const filteredSongs = state.searchTerm 
         ? s.allSongs.filter(item => item.title.toLowerCase().includes(searchLower) || item.artist.toLowerCase().includes(searchLower)).slice(0, 100)
         : s.topSongs;
@@ -878,7 +994,6 @@ function renderDashboard() {
 
     return `
         <div class="space-y-8 animate-fade-in-up">
-            <!-- 概要 -->
             <div class="space-y-4">
                 <div class="bg-gradient-to-r from-gray-800 to-gray-800/50 border border-gray-700 rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-4">
                     <div class="flex items-center gap-3">
@@ -903,7 +1018,6 @@ function renderDashboard() {
                 </div>
             </div>
 
-            <!-- ランキング -->
             <div class="space-y-6">
                 <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
                     <h2 class="text-2xl font-bold text-white flex items-center gap-2">
@@ -918,7 +1032,6 @@ function renderDashboard() {
                 </div>
 
                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                    <!-- 楽曲ランキング -->
                     <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[1200px]">
                         <div class="p-4 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center sticky top-0 z-10 backdrop-blur">
                             <h3 class="font-bold flex items-center gap-2 text-white">
@@ -934,7 +1047,6 @@ function renderDashboard() {
                         </div>
                     </div>
 
-                    <!-- アーティストランキング -->
                     <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[1200px]">
                         <div class="p-4 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center sticky top-0 z-10 backdrop-blur">
                             <h3 class="font-bold flex items-center gap-2 text-white">
@@ -952,7 +1064,6 @@ function renderDashboard() {
                 </div>
             </div>
 
-            <!-- 詳細統計 -->
             <div class="pt-8 border-t border-gray-800">
                 <h2 class="text-2xl font-bold text-white mb-6 flex items-center gap-2">
                     <i data-lucide="trending-up" class="text-blue-500"></i>
@@ -992,8 +1103,6 @@ function renderDashboard() {
     `;
 }
 
-// グラフやカード等の描画ヘルパー関数は変更なしのため省略...
-// (renderStatCard, renderRankingItem, renderBarChart, renderPieChart はそのまま使用)
 function renderStatCard(title, value, subtext, icon, colorClass, className = "") {
     return `
         <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700 flex items-start space-x-4 hover:bg-gray-750 transition-colors h-full ${className}">
@@ -1018,19 +1127,7 @@ function renderRankingItem(rank, title, subtitle, count, percentage, songUrl, ar
     else if (rank === 2) crownIcon = '<i data-lucide="crown" class="w-5 h-5 text-gray-300 mb-1 fill-current"></i>';
     else if (rank === 3) crownIcon = '<i data-lucide="crown" class="w-5 h-5 text-amber-600 mb-1 fill-current"></i>';
 
-    // タイトルとサブタイトルのエスケープ処理（属性値用）
-    // NOTE: title, subtitle は highlightText で既にHTML化されている可能性があるが、
-    // ここではコピー用データとして生テキストが必要。
-    // highlightTextはrenderDashboardやupdateRankingsで呼ばれる直前に適用されるべき。
-    // この関数の引数 title, subtitle はハイライト済みHTMLとして渡ってくる前提で、
-    // コピー用の生テキストは別途渡すか、タグを除去する必要がある。
-    // しかし、updateRankingsのロジックを見ると highlightText を通したものを渡している。
-    // したがって、ここでタグを除去して生テキストに戻す処理を入れる。
-    
     const rawTitle = title.replace(/<[^>]*>/g, '').replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-    
-    // コピー用のエスケープ（HTML属性に入れたときに壊れないように）
-    // data-text属性に入れるので、ダブルクォートのみエスケープすればよい
     const copyText = rawTitle.replace(/"/g, '&quot;');
 
     const titleHTML = songUrl 
@@ -1092,14 +1189,12 @@ function renderRankingItem(rank, title, subtitle, count, percentage, songUrl, ar
     `;
 }
 
-// 検索時にランキングのみを更新する関数（IME対策）
 function updateRankings() {
     const s = state.stats;
     if (!s) return;
 
     const searchLower = state.searchTerm.toLowerCase();
     
-    // ハイライト関数再定義（スコープ内）
     const highlightText = (text) => {
         if (!state.searchTerm || !text) return text;
         const escapedText = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
@@ -1115,7 +1210,6 @@ function updateRankings() {
         ? s.allArtists.filter(item => item.name.toLowerCase().includes(searchLower)).slice(0, 100)
         : s.topArtists;
 
-    // 件数バッジの更新
     const songBadge = document.getElementById('song-count-badge');
     const artistBadge = document.getElementById('artist-count-badge');
     if (songBadge) {
@@ -1127,7 +1221,6 @@ function updateRankings() {
         artistBadge.classList.toggle('hidden', !state.searchTerm);
     }
 
-    // リストの中身だけ更新
     const songList = document.getElementById('song-ranking-list');
     const artistList = document.getElementById('artist-ranking-list');
 
@@ -1166,11 +1259,9 @@ function renderBarChart(data, colorClass, showLabels, labelRotate = false) {
     return `<div class="flex items-end justify-between space-x-1 h-full w-full">${bars}</div>`;
 }
 
-// 円グラフ描画 (SVG)
 function renderPieChart(data) {
     if (!data || data.length === 0) return '';
 
-    // カラーパレット
     const colors = [
         '#ef4444', '#f97316', '#f59e0b', '#eab308', '#84cc16', 
         '#22c55e', '#10b981', '#14b8a6', '#06b6d4', '#0ea5e9', '#64748b'
@@ -1178,7 +1269,6 @@ function renderPieChart(data) {
 
     let cumulativePercent = 0;
     
-    // SVGパスの生成
     function getCoordinatesForPercent(percent) {
         const x = Math.cos(2 * Math.PI * percent);
         const y = Math.sin(2 * Math.PI * percent);
@@ -1190,7 +1280,6 @@ function renderPieChart(data) {
         const endPercent = cumulativePercent + (slice.percent / 100);
         cumulativePercent = endPercent;
 
-        // 100%の場合は円全体
         if (slice.percent >= 100) {
             return `<circle cx="0" cy="0" r="1" fill="${colors[index % colors.length]}" />`;
         }
@@ -1209,7 +1298,6 @@ function renderPieChart(data) {
         return `<path d="${pathData}" fill="${colors[index % colors.length]}" stroke="#1f2937" stroke-width="0.02" class="hover:opacity-80 transition-opacity"><title>${slice.label}: ${slice.percent}%</title></path>`;
     }).join('');
 
-    // 凡例の生成
     const legends = data.map((slice, index) => `
         <div class="flex items-center justify-between text-xs mb-1">
             <div class="flex items-center">
@@ -1241,7 +1329,7 @@ window.deleteHistoryAndReload = async (id) => {
     if(confirm('この履歴を削除してもよろしいですか？')) {
         await deleteHistory(id);
         await loadHistoryList();
-        renderMain(); // リスト更新
+        renderMain();
     }
 };
 window.openDetailModal = openDetailModal;
@@ -1255,6 +1343,8 @@ function setupHeaderListeners() {
     const downloadBtn = document.getElementById('downloadBtn');
     const backupBtn = document.getElementById('backupBtn');
     const resetBtn = document.getElementById('resetBtn');
+    const addFileBtn = document.getElementById('addFileBtn');
+    const headerFileInput = document.getElementById('headerFileInput');
 
     if (yearSelect) {
         yearSelect.addEventListener('change', (e) => {
@@ -1287,12 +1377,28 @@ function setupHeaderListeners() {
 
     if (downloadBtn) downloadBtn.addEventListener('click', downloadCSV);
     if (backupBtn) backupBtn.addEventListener('click', downloadJSON);
-    if (resetBtn) resetBtn.addEventListener('click', () => {
-        state.stats = null;
-        state.rawData = null;
-        renderHeader();
-        renderMain();
-    });
+    
+    // クリアボタン（全データリセット）
+    if (resetBtn) {
+        resetBtn.addEventListener('click', () => {
+            if (confirm('現在の表示データをクリアして、トップ画面に戻りますか？\n(履歴自体は保存されています)')) {
+                state.stats = null;
+                state.rawData = null;
+                renderHeader();
+                renderMain();
+            }
+        });
+    }
+
+    // 追加マージ用ボタンと隠しファイル入力の連携
+    if (addFileBtn && headerFileInput) {
+        addFileBtn.addEventListener('click', () => headerFileInput.click());
+        headerFileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFiles(e.target.files);
+            }
+        });
+    }
 }
 
 function setupMainListeners() {
@@ -1300,14 +1406,16 @@ function setupMainListeners() {
     const dropZone = document.getElementById('dropZone');
     
     if (fileInput) {
-        fileInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
+        fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
         dropZone.addEventListener('dragenter', (e) => { e.preventDefault(); state.dragActive = true; renderUploadScreenAndUpdate(); });
         dropZone.addEventListener('dragleave', (e) => { e.preventDefault(); state.dragActive = false; renderUploadScreenAndUpdate(); });
         dropZone.addEventListener('dragover', (e) => e.preventDefault());
         dropZone.addEventListener('drop', (e) => {
             e.preventDefault();
             state.dragActive = false;
-            if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                handleFiles(e.dataTransfer.files);
+            }
         });
     }
 
@@ -1315,7 +1423,6 @@ function setupMainListeners() {
     if (searchInput) {
         searchInput.addEventListener('input', (e) => {
             state.searchTerm = e.target.value;
-            // 全体再描画(renderMain)ではなく、ランキング部分だけ更新する
             updateRankings();
         });
     }
