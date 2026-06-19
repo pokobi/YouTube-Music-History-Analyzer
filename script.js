@@ -1036,7 +1036,7 @@ function renderDashboard() {
 
                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                     <!-- 楽曲ランキング -->
-                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[500px]">
+                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[580px]">
                         <div class="p-4 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center sticky top-0 z-10 backdrop-blur">
                             <h3 class="font-bold flex items-center gap-2 text-white">
                                 <i data-lucide="music" class="w-5 h-5 text-yellow-500"></i>
@@ -1052,7 +1052,7 @@ function renderDashboard() {
                     </div>
 
                     <!-- アーティストランキング -->
-                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[500px]">
+                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[580px]">
                         <div class="p-4 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center sticky top-0 z-10 backdrop-blur">
                             <h3 class="font-bold flex items-center gap-2 text-white">
                                 <i data-lucide="mic" class="w-5 h-5 text-purple-500"></i>
