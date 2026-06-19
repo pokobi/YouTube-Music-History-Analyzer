@@ -14,7 +14,9 @@ const state = {
     historyList: [],      // 保存された履歴リスト
     db: null,             // IndexedDBインスタンス
     modal: null,          // モーダル表示用データ
-    showScrollTop: false  // トップへ戻るボタンの表示状態
+    showScrollTop: false, // トップへ戻るボタンの表示状態
+    expandedSongs: false, // 楽曲ランキングの拡張状態
+    expandedArtists: false // アーティストランキングの拡張状態
 };
 
 // --- IndexedDB ヘルパー (履歴保存用) ---
@@ -444,6 +446,8 @@ function resetFilters() {
     state.filter.startDate = '';
     state.filter.endDate = '';
     state.searchTerm = '';
+    state.expandedSongs = false;
+    state.expandedArtists = false;
 }
 
 // 生JSONのパース処理
@@ -686,10 +690,6 @@ function closeModal() {
 // 1. ヘッダー描画
 function renderHeader() {
     const container = document.getElementById('header-container');
-    
-    // 【変更箇所】
-    // スマホ時はrelative（追従しない）、PC・タブレット(md以上)時はsticky（上部固定）にするよう変更。
-    // さらにパディングなどを細かく調整し、スマホでも余計なスペースを取らないようにしました。
     const headerHTML = `
         <header class="border-b border-gray-800 bg-gray-900/50 backdrop-blur-md relative md:sticky md:top-0 z-50">
             <div class="max-w-7xl mx-auto px-4 py-3 md:py-4 flex flex-col md:flex-row items-center justify-between gap-3 md:gap-4">
@@ -822,8 +822,6 @@ function renderControls() {
 
     const today = getTodayString();
 
-    // 【変更箇所】
-    // スマホ画面でUIが縦に長くなりすぎないように、flex-wrapを使いつつボタン等のサイズをコンパクトにしました
     return `
         <div class="flex flex-col xl:flex-row items-center gap-3 w-full md:w-auto mt-1 md:mt-0">
             <div class="flex flex-wrap justify-center items-center gap-2 w-full md:w-auto">
@@ -999,8 +997,29 @@ function renderDashboard() {
         ? s.allArtists.filter(item => item.name.toLowerCase().includes(searchLower)).slice(0, 100)
         : s.topArtists;
 
+    // 折りたたみ用の表示件数切り替え
+    const showSongsCount = (state.expandedSongs || state.searchTerm) ? 100 : 5;
+    const showArtistsCount = (state.expandedArtists || state.searchTerm) ? 100 : 5;
+
+    const visibleSongs = filteredSongs.slice(0, showSongsCount);
+    const visibleArtists = filteredArtists.slice(0, showArtistsCount);
+
+    // もっと見るボタンの生成
+    const songExpandBtn = (!state.searchTerm && filteredSongs.length > 5)
+        ? `<button onclick="toggleExpand('songs')" class="w-full py-3 mt-2 text-sm text-gray-400 hover:text-white bg-gray-700/30 hover:bg-gray-700/50 rounded-lg transition-colors flex items-center justify-center gap-2 border border-gray-700">
+            <i data-lucide="${state.expandedSongs ? 'chevron-up' : 'chevron-down'}" class="w-4 h-4"></i>
+            ${state.expandedSongs ? '閉じる' : 'もっと見る (TOP100)'}
+           </button>` : '';
+
+    const artistExpandBtn = (!state.searchTerm && filteredArtists.length > 5)
+        ? `<button onclick="toggleExpand('artists')" class="w-full py-3 mt-2 text-sm text-gray-400 hover:text-white bg-gray-700/30 hover:bg-gray-700/50 rounded-lg transition-colors flex items-center justify-center gap-2 border border-gray-700">
+            <i data-lucide="${state.expandedArtists ? 'chevron-up' : 'chevron-down'}" class="w-4 h-4"></i>
+            ${state.expandedArtists ? '閉じる' : 'もっと見る (TOP100)'}
+           </button>` : '';
+
     return `
         <div class="space-y-8 animate-fade-in-up">
+            <!-- 概要 -->
             <div class="space-y-4">
                 <div class="bg-gradient-to-r from-gray-800 to-gray-800/50 border border-gray-700 rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-4">
                     <div class="flex items-center gap-3">
@@ -1025,6 +1044,7 @@ function renderDashboard() {
                 </div>
             </div>
 
+            <!-- ランキング -->
             <div class="space-y-6">
                 <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
                     <h2 class="text-2xl font-bold text-white flex items-center gap-2">
@@ -1039,7 +1059,8 @@ function renderDashboard() {
                 </div>
 
                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[1200px]">
+                    <!-- 楽曲ランキング -->
+                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col max-h-[800px]">
                         <div class="p-4 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center sticky top-0 z-10 backdrop-blur">
                             <h3 class="font-bold flex items-center gap-2 text-white">
                                 <i data-lucide="music" class="w-5 h-5 text-yellow-500"></i>
@@ -1048,13 +1069,14 @@ function renderDashboard() {
                             <span id="song-count-badge" class="bg-gray-700 text-white text-xs px-2 py-1 rounded-full ${state.searchTerm ? '' : 'hidden'}">${filteredSongs.length}件</span>
                         </div>
                         <div id="song-ranking-list" class="overflow-y-auto flex-1 p-4 custom-scrollbar">
-                            ${filteredSongs.length > 0 ? filteredSongs.map((song, idx) => 
+                            ${visibleSongs.length > 0 ? visibleSongs.map((song, idx) => 
                                 renderRankingItem(idx + 1, highlightText(song.title), highlightText(song.artist), song.count, s.topSongs[0] ? (song.count / s.topSongs[0].count) * 100 : 0, song.url, song.artistUrl, song.firstPlayed, song.imgId, 'song', null, song.id || `${song.title}-${song.artist}`)
-                            ).join('') : '<div class="text-center text-gray-500 py-10">該当なし</div>'}
+                            ).join('') + songExpandBtn : '<div class="text-center text-gray-500 py-10">該当なし</div>'}
                         </div>
                     </div>
 
-                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[1200px]">
+                    <!-- アーティストランキング -->
+                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col max-h-[800px]">
                         <div class="p-4 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center sticky top-0 z-10 backdrop-blur">
                             <h3 class="font-bold flex items-center gap-2 text-white">
                                 <i data-lucide="mic" class="w-5 h-5 text-purple-500"></i>
@@ -1063,14 +1085,15 @@ function renderDashboard() {
                             <span id="artist-count-badge" class="bg-gray-700 text-white text-xs px-2 py-1 rounded-full ${state.searchTerm ? '' : 'hidden'}">${filteredArtists.length}件</span>
                         </div>
                         <div id="artist-ranking-list" class="overflow-y-auto flex-1 p-4 custom-scrollbar">
-                            ${filteredArtists.length > 0 ? filteredArtists.map((artist, idx) => 
+                            ${visibleArtists.length > 0 ? visibleArtists.map((artist, idx) => 
                                 renderRankingItem(idx + 1, highlightText(artist.name), null, artist.count, s.topArtists[0] ? (artist.count / s.topArtists[0].count) * 100 : 0, artist.url, null, artist.firstPlayed, null, 'artist', artist.percentage, artist.id || artist.name)
-                            ).join('') : '<div class="text-center text-gray-500 py-10">該当なし</div>'}
+                            ).join('') + artistExpandBtn : '<div class="text-center text-gray-500 py-10">該当なし</div>'}
                         </div>
                     </div>
                 </div>
             </div>
 
+            <!-- 詳細統計 -->
             <div class="pt-8 border-t border-gray-800">
                 <h2 class="text-2xl font-bold text-white mb-6 flex items-center gap-2">
                     <i data-lucide="trending-up" class="text-blue-500"></i>
@@ -1217,6 +1240,25 @@ function updateRankings() {
         ? s.allArtists.filter(item => item.name.toLowerCase().includes(searchLower)).slice(0, 100)
         : s.topArtists;
 
+    // 折りたたみ用の表示件数切り替え
+    const showSongsCount = (state.expandedSongs || state.searchTerm) ? 100 : 5;
+    const showArtistsCount = (state.expandedArtists || state.searchTerm) ? 100 : 5;
+
+    const visibleSongs = filteredSongs.slice(0, showSongsCount);
+    const visibleArtists = filteredArtists.slice(0, showArtistsCount);
+
+    const songExpandBtn = (!state.searchTerm && filteredSongs.length > 5)
+        ? `<button onclick="toggleExpand('songs')" class="w-full py-3 mt-2 text-sm text-gray-400 hover:text-white bg-gray-700/30 hover:bg-gray-700/50 rounded-lg transition-colors flex items-center justify-center gap-2 border border-gray-700">
+            <i data-lucide="${state.expandedSongs ? 'chevron-up' : 'chevron-down'}" class="w-4 h-4"></i>
+            ${state.expandedSongs ? '閉じる' : 'もっと見る (TOP100)'}
+           </button>` : '';
+
+    const artistExpandBtn = (!state.searchTerm && filteredArtists.length > 5)
+        ? `<button onclick="toggleExpand('artists')" class="w-full py-3 mt-2 text-sm text-gray-400 hover:text-white bg-gray-700/30 hover:bg-gray-700/50 rounded-lg transition-colors flex items-center justify-center gap-2 border border-gray-700">
+            <i data-lucide="${state.expandedArtists ? 'chevron-up' : 'chevron-down'}" class="w-4 h-4"></i>
+            ${state.expandedArtists ? '閉じる' : 'もっと見る (TOP100)'}
+           </button>` : '';
+
     const songBadge = document.getElementById('song-count-badge');
     const artistBadge = document.getElementById('artist-count-badge');
     if (songBadge) {
@@ -1232,15 +1274,15 @@ function updateRankings() {
     const artistList = document.getElementById('artist-ranking-list');
 
     if (songList) {
-        songList.innerHTML = filteredSongs.length > 0 ? filteredSongs.map((song, idx) => 
+        songList.innerHTML = visibleSongs.length > 0 ? visibleSongs.map((song, idx) => 
             renderRankingItem(idx + 1, highlightText(song.title), highlightText(song.artist), song.count, s.topSongs[0] ? (song.count / s.topSongs[0].count) * 100 : 0, song.url, song.artistUrl, song.firstPlayed, song.imgId, 'song', null, song.id || `${song.title}-${song.artist}`)
-        ).join('') : '<div class="text-center text-gray-500 py-10">該当なし</div>';
+        ).join('') + songExpandBtn : '<div class="text-center text-gray-500 py-10">該当なし</div>';
     }
 
     if (artistList) {
-        artistList.innerHTML = filteredArtists.length > 0 ? filteredArtists.map((artist, idx) => 
+        artistList.innerHTML = visibleArtists.length > 0 ? visibleArtists.map((artist, idx) => 
             renderRankingItem(idx + 1, highlightText(artist.name), null, artist.count, s.topArtists[0] ? (artist.count / s.topArtists[0].count) * 100 : 0, artist.url, null, artist.firstPlayed, null, 'artist', artist.percentage, artist.id || artist.name)
-        ).join('') : '<div class="text-center text-gray-500 py-10">該当なし</div>';
+        ).join('') + artistExpandBtn : '<div class="text-center text-gray-500 py-10">該当なし</div>';
     }
     
     lucide.createIcons();
@@ -1342,6 +1384,11 @@ window.deleteHistoryAndReload = async (id) => {
 window.openDetailModal = openDetailModal;
 window.closeModal = closeModal;
 window.copyToClipboard = copyToClipboard;
+window.toggleExpand = (type) => {
+    if (type === 'songs') state.expandedSongs = !state.expandedSongs;
+    if (type === 'artists') state.expandedArtists = !state.expandedArtists;
+    updateRankings();
+};
 
 function setupHeaderListeners() {
     const yearSelect = document.getElementById('yearSelect');
