@@ -686,10 +686,6 @@ function closeModal() {
 // 1. ヘッダー描画
 function renderHeader() {
     const container = document.getElementById('header-container');
-    
-    // 【変更箇所】
-    // スマホ時はrelative（追従しない）、PC・タブレット(md以上)時はsticky（上部固定）にするよう変更。
-    // さらにパディングなどを細かく調整し、スマホでも余計なスペースを取らないようにしました。
     const headerHTML = `
         <header class="border-b border-gray-800 bg-gray-900/50 backdrop-blur-md relative md:sticky md:top-0 z-50">
             <div class="max-w-7xl mx-auto px-4 py-3 md:py-4 flex flex-col md:flex-row items-center justify-between gap-3 md:gap-4">
@@ -822,8 +818,6 @@ function renderControls() {
 
     const today = getTodayString();
 
-    // 【変更箇所】
-    // スマホ画面でUIが縦に長くなりすぎないように、flex-wrapを使いつつボタン等のサイズをコンパクトにしました
     return `
         <div class="flex flex-col xl:flex-row items-center gap-3 w-full md:w-auto mt-1 md:mt-0">
             <div class="flex flex-wrap justify-center items-center gap-2 w-full md:w-auto">
@@ -1001,6 +995,7 @@ function renderDashboard() {
 
     return `
         <div class="space-y-8 animate-fade-in-up">
+            <!-- 概要 -->
             <div class="space-y-4">
                 <div class="bg-gradient-to-r from-gray-800 to-gray-800/50 border border-gray-700 rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-4">
                     <div class="flex items-center gap-3">
@@ -1025,6 +1020,7 @@ function renderDashboard() {
                 </div>
             </div>
 
+            <!-- ランキング -->
             <div class="space-y-6">
                 <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
                     <h2 class="text-2xl font-bold text-white flex items-center gap-2">
@@ -1039,7 +1035,8 @@ function renderDashboard() {
                 </div>
 
                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[1200px]">
+                    <!-- 楽曲ランキング -->
+                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[500px]">
                         <div class="p-4 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center sticky top-0 z-10 backdrop-blur">
                             <h3 class="font-bold flex items-center gap-2 text-white">
                                 <i data-lucide="music" class="w-5 h-5 text-yellow-500"></i>
@@ -1054,7 +1051,8 @@ function renderDashboard() {
                         </div>
                     </div>
 
-                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[1200px]">
+                    <!-- アーティストランキング -->
+                    <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden flex flex-col h-[500px]">
                         <div class="p-4 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center sticky top-0 z-10 backdrop-blur">
                             <h3 class="font-bold flex items-center gap-2 text-white">
                                 <i data-lucide="mic" class="w-5 h-5 text-purple-500"></i>
@@ -1071,6 +1069,7 @@ function renderDashboard() {
                 </div>
             </div>
 
+            <!-- 詳細統計 -->
             <div class="pt-8 border-t border-gray-800">
                 <h2 class="text-2xl font-bold text-white mb-6 flex items-center gap-2">
                     <i data-lucide="trending-up" class="text-blue-500"></i>
