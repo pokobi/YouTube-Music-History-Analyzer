@@ -147,3 +147,71 @@ test('日付ヘルパーと HTML エスケープ', () => {
     assert.equal(esc('<a href="x">'), '&lt;a href=&quot;x&quot;&gt;');
     assert.equal(String(html`<b>${'<i>'}</b>${raw('<br>')}`), '<b>&lt;i&gt;</b><br>');
 });
+
+// --- 推定再生時間・スキップ・曲のまとめ・ハマった曲 ---
+
+import { findMergeCandidates, baseTitle, SKIP_MS } from '../js/model.js';
+import { rankByTime, busiestWindow, dayDetail, computeHighlights } from '../js/stats.js';
+
+function seqModel(settings = {}) {
+    // 3 分ごとに A, A, B（B の直後 10 秒で C）…という並び
+    const base = new Date(2024, 4, 1, 10).getTime();
+    const items = [];
+    const push = (ms, v, title, artist) => items.push(play(new Date(base + ms).toISOString(), v, title, artist));
+    push(0, 'aaaaaaaaaaa', 'Song A', 'Artist X');
+    push(180000, 'aaaaaaaaaaa', 'Song A', 'Artist X');
+    push(360000, 'bbbbbbbbbbb', 'Song B', 'Artist X');
+    push(370000, 'ccccccccccc', 'Song A (Official Music Video)', 'Artist X');
+    push(550000, 'aaaaaaaaaaa', 'Song A', 'Artist X');
+    const src = parseText('x.json', JSON.stringify(items));
+    const { dataset } = mergeEntries(emptyDataset(), src.entries);
+    return { dataset, model: buildModel(dataset, { ...defaultSettings(), ...settings }) };
+}
+
+test('スキップの判定と推定再生時間', () => {
+    const { model } = seqModel();
+    const b = model.tracks.findIndex((t) => t.v === 'bbbbbbbbbbb');
+    const i = Array.from(model.trackIdx).indexOf(b);
+    assert.equal(model.skip[i], 1);
+    assert.equal(model.dur[i], 10000);
+    assert.ok(10000 < SKIP_MS);
+    const s = computeStats(model, { start: null, end: null });
+    assert.equal(s.skips, 1);
+    assert.equal(s.total, 5);
+    const byTime = rankByTime(s, 'songs');
+    assert.equal(model.tracks[byTime[0].i].v, 'aaaaaaaaaaa');
+});
+
+test('スキップを除外する設定', () => {
+    const { model } = seqModel({ excludeSkips: true });
+    const s = computeStats(model, { start: null, end: null });
+    assert.equal(s.total, 4);
+    assert.equal(s.skips, 1);
+});
+
+test('曲のまとめ候補と、まとめた結果', () => {
+    assert.equal(baseTitle('Song A (Official Music Video)'), baseTitle('Song A'));
+    assert.notEqual(baseTitle('Song A (Live at Budokan)'), baseTitle('Song A'));
+    const { dataset, model } = seqModel();
+    const cands = findMergeCandidates(model);
+    assert.equal(cands.length, 1);
+    assert.equal(model.tracks[cands[0].tracks[0]].v, 'aaaaaaaaaaa');
+    assert.equal(findMergeCandidates(model, [cands[0].id]).length, 0);
+
+    const merged = buildModel(dataset, { ...defaultSettings(), trackAliases: { 'v:ccccccccccc': 'v:aaaaaaaaaaa' } });
+    const s = computeStats(merged, { start: null, end: null });
+    assert.equal(s.songs[0].count, 4);
+    assert.equal(merged.tracks[s.songs[0].i].title, 'Song A');
+    assert.deepEqual(merged.tracks[s.songs[0].i].variants, ['Song A (Official Music Video)']);
+});
+
+test('集中して聴いた期間と 1 日の詳細', () => {
+    assert.deepEqual(busiestWindow([1, 2, 40, 41, 42, 80], 30), { count: 3, start: 40, end: 42 });
+    const { model } = seqModel();
+    const d = dayDetail(model, dayFromYmd(2024, 4, 1));
+    assert.equal(d.count, 5);
+    assert.equal(model.artists[d.topArtists[0].i].name, 'Artist X');
+    const s = computeStats(model, { start: null, end: null });
+    const h = computeHighlights(model, s, { minPlays: 2 });
+    assert.equal(h.bursts[0].count, 3);
+});

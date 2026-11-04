@@ -117,6 +117,15 @@ export function todayStamp() {
     return dayToInput(dayNumber(Date.now()));
 }
 
+/** 再生時間の表示（例: 45分、12.3時間、1,234時間） */
+export function formatDuration(ms) {
+    const min = (ms || 0) / 60000;
+    if (min < 60) return `${Math.round(min)}分`;
+    const h = min / 60;
+    if (h < 100) return `${h.toFixed(1)}時間`;
+    return `${Math.round(h).toLocaleString('ja-JP')}時間`;
+}
+
 /** 昇順配列から value 以上となる最初の位置 */
 export function lowerBound(arr, value) {
     let lo = 0, hi = arr.length;

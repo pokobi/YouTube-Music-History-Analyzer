@@ -108,8 +108,8 @@ function countRange(model, range) {
     const artistCounts = new Uint32Array(model.artists.length);
     let total = 0;
     for (let i = lo; i < hi; i++) {
+        if (model.off[i]) continue;
         const ti = model.trackIdx[i];
-        if (model.trackExcluded[ti]) continue;
         total++;
         trackCounts[ti]++;
         artistCounts[model.tracks[ti].artistIdx]++;
@@ -125,6 +125,8 @@ export function computeRanks(model, range) {
     const artists = rankList(artistCounts, byFirst(model.artistFirst));
     return {
         total,
+        trackCounts,
+        artistCounts,
         songRank: new Map(songs.map((x) => [x.i, x.rank])),
         artistRank: new Map(artists.map((x) => [x.i, x.rank])),
     };
@@ -135,15 +137,28 @@ export function computeStats(model, range) {
     const hourly = new Array(24).fill(0);
     const weekHour = Array.from({ length: 7 }, () => new Array(24).fill(0));
     const daily = new Map();
+    const trackMs = new Float64Array(model.tracks.length);
+    const artistMs = new Float64Array(model.artists.length);
+    let totalMs = 0;
+    let skips = 0;
+    let skipBase = 0;
 
     for (let i = lo; i < hi; i++) {
         const ti = model.trackIdx[i];
-        if (model.trackExcluded[ti]) continue;
+        if (!model.trackExcluded[ti]) {
+            skipBase++;
+            if (model.skip[i]) skips++;
+        }
+        if (model.off[i]) continue;
         const d = model.day[i];
         const h = model.hour[i];
         hourly[h]++;
         weekHour[dayWeekday(d)][h]++;
         daily.set(d, (daily.get(d) || 0) + 1);
+        const ms = model.dur[i];
+        totalMs += ms;
+        trackMs[ti] += ms;
+        artistMs[model.tracks[ti].artistIdx] += ms;
     }
 
     const byFirst = (arr) => (a, b) => arr[a] - arr[b];
@@ -203,12 +218,14 @@ export function computeStats(model, range) {
         newArtists.push(ai);
     });
 
-    const share = artists.slice(0, 10).map((x) => ({ i: x.i, count: x.count }));
-    const others = total - share.reduce((s, x) => s + x.count, 0);
-
     return {
         range,
+        lo,
+        hi,
         total,
+        totalMs,
+        skips,
+        skipBase,
         activeDays: daily.size,
         spanStart,
         spanEnd,
@@ -220,6 +237,8 @@ export function computeStats(model, range) {
         artists,
         trackCounts,
         artistCounts,
+        trackMs,
+        artistMs,
         hourly,
         weekHour,
         daily,
@@ -229,61 +248,148 @@ export function computeStats(model, range) {
         newArtists,
         newTracksMonthly: fillMonths(newTracksByMonth, spanStart, spanEnd),
         newArtistsMonthly: fillMonths(newArtistsByMonth, spanStart, spanEnd),
-        share,
-        others,
     };
 }
 
-/** 曲 1 つの詳細 */
+/** 推定再生時間の順位（回数の順位と同じ形） */
+export function rankByTime(stats, type) {
+    const ms = type === 'artists' ? stats.artistMs : stats.trackMs;
+    const counts = type === 'artists' ? stats.artistCounts : stats.trackCounts;
+    const list = [];
+    for (let i = 0; i < ms.length; i++) if (counts[i] > 0) list.push({ i, count: counts[i], ms: ms[i] });
+    list.sort((a, b) => b.ms - a.ms || b.count - a.count);
+    list.forEach((x, k) => { x.rank = k + 1; });
+    return list;
+}
+
+/** 日番号の昇順配列の中で、window 日間に最も多く含まれる区間 */
+export function busiestWindow(days, window = 30) {
+    let best = { count: 0, start: null, end: null };
+    let j = 0;
+    for (let k = 0; k < days.length; k++) {
+        while (days[k] - days[j] >= window) j++;
+        const c = k - j + 1;
+        if (c > best.count) best = { count: c, start: days[j], end: days[k] };
+    }
+    return best;
+}
+
+/** 曲 1 つの詳細（除外中の曲でも数える） */
 export function trackDetail(model, ti, range) {
     const { lo, hi } = bounds(model, range);
     const plays = [];
+    const days = [];
     const monthMap = new Map();
+    let ms = 0, skips = 0;
     for (let i = lo; i < hi; i++) {
         if (model.trackIdx[i] !== ti) continue;
+        if (model.excludeSkips && model.skip[i]) continue;
         plays.push(model.times[i]);
+        days.push(model.day[i]);
+        ms += model.dur[i];
+        if (model.skip[i]) skips++;
         const mi = monthOfDay(model.day[i]);
         monthMap.set(mi, (monthMap.get(mi) || 0) + 1);
     }
-    const startDay = range.start ?? (plays.length ? dayNumber(plays[0]) : null);
-    const endDay = range.end ?? (plays.length ? dayNumber(plays[plays.length - 1]) : null);
+    const startDay = range.start ?? (days.length ? days[0] : null);
+    const endDay = range.end ?? (days.length ? days[days.length - 1] : null);
     plays.reverse();
     return {
         count: plays.length,
+        ms,
+        skips,
         first: plays.length ? plays[plays.length - 1] : null,
         last: plays.length ? plays[0] : null,
+        burst: busiestWindow(days),
         monthly: fillMonths(monthMap, startDay, endDay),
         plays,
     };
 }
 
-/** アーティスト 1 人の詳細 */
+/** アーティスト 1 人の詳細（アーティストを除外中でも数える） */
 export function artistDetail(model, ai, range) {
     const { lo, hi } = bounds(model, range);
     const plays = [];
+    const days = [];
     const monthMap = new Map();
     const perTrack = new Map();
+    let ms = 0;
+    const artistOff = !!model.artistExcluded[ai];
     for (let i = lo; i < hi; i++) {
         const ti = model.trackIdx[i];
         if (model.tracks[ti].artistIdx !== ai) continue;
-        if (model.trackExcluded[ti] && !model.artistExcluded[ai]) continue;
+        if (model.excludeSkips && model.skip[i]) continue;
+        if (model.off[i] && !artistOff) continue;
         plays.push({ t: model.times[i], ti });
+        days.push(model.day[i]);
+        ms += model.dur[i];
         perTrack.set(ti, (perTrack.get(ti) || 0) + 1);
         const mi = monthOfDay(model.day[i]);
         monthMap.set(mi, (monthMap.get(mi) || 0) + 1);
     }
-    const startDay = range.start ?? (plays.length ? dayNumber(plays[0].t) : null);
-    const endDay = range.end ?? (plays.length ? dayNumber(plays[plays.length - 1].t) : null);
+    const startDay = range.start ?? (days.length ? days[0] : null);
+    const endDay = range.end ?? (days.length ? days[days.length - 1] : null);
     plays.reverse();
     const topTracks = [...perTrack.entries()]
         .map(([ti, count]) => ({ ti, count }))
         .sort((a, b) => b.count - a.count || model.trackFirst[a.ti] - model.trackFirst[b.ti]);
     return {
         count: plays.length,
+        ms,
         first: plays.length ? plays[plays.length - 1].t : null,
         last: plays.length ? plays[0].t : null,
+        burst: busiestWindow(days),
         monthly: fillMonths(monthMap, startDay, endDay),
         topTracks,
         plays,
     };
+}
+
+/** 1 日分の再生 */
+export function dayDetail(model, d) {
+    const lo = lowerBound(model.day, d);
+    const hi = lowerBound(model.day, d + 1);
+    const plays = [];
+    const perArtist = new Map();
+    let ms = 0;
+    for (let i = lo; i < hi; i++) {
+        if (model.off[i]) continue;
+        const ti = model.trackIdx[i];
+        plays.push({ t: model.times[i], ti, skip: !!model.skip[i] });
+        ms += model.dur[i];
+        const ai = model.tracks[ti].artistIdx;
+        perArtist.set(ai, (perArtist.get(ai) || 0) + 1);
+    }
+    const topArtists = [...perArtist.entries()].map(([i, count]) => ({ i, count })).sort((a, b) => b.count - a.count);
+    return { count: plays.length, ms, plays, topArtists };
+}
+
+/**
+ * ハマった曲（一定の日数に集中して再生した曲）と、最近聴かなくなった曲
+ * dormantDays: データの最終日からこの日数より前が最後の再生なら「聴かなくなった」とみなす
+ */
+export function computeHighlights(model, stats, { window = 30, dormantDays = 90, minPlays = 5 } = {}) {
+    const perTrack = new Map();
+    for (let i = stats.lo; i < stats.hi; i++) {
+        if (model.off[i]) continue;
+        const ti = model.trackIdx[i];
+        if (stats.trackCounts[ti] < minPlays) continue;
+        let list = perTrack.get(ti);
+        if (!list) perTrack.set(ti, (list = []));
+        list.push(model.day[i]);
+    }
+    const bursts = [];
+    for (const [ti, days] of perTrack) {
+        const b = busiestWindow(days, window);
+        bursts.push({ i: ti, count: b.count, start: b.start, end: b.end, total: days.length });
+    }
+    bursts.sort((a, b) => b.count - a.count || b.total - a.total);
+
+    const cutoff = model.maxDay - dormantDays;
+    const dormant = stats.songs
+        .filter((x) => x.count >= minPlays && isFinite(model.trackLast[x.i]) && dayNumber(model.trackLast[x.i]) < cutoff)
+        .slice(0, 10)
+        .map((x) => ({ ...x, last: model.trackLast[x.i] }));
+
+    return { bursts: bursts.slice(0, 10), dormant, dormantDays, window };
 }

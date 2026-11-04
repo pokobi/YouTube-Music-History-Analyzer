@@ -54,7 +54,7 @@ export function calendarHeatmap(daily, year) {
     for (let d = start; d <= end; d++) {
         const v = daily.get(d) || 0;
         const wd = WEEKDAYS[dayWeekday(d)];
-        cells.push(raw(`<i class="lv${level(v)}" data-tip="${formatDay(d)}（${wd}） ${formatNumber(v)}回"></i>`));
+        cells.push(raw(`<i class="lv${level(v)}" data-action="open-day" data-value="${d}" data-tip="${formatDay(d)}（${wd}） ${formatNumber(v)}回"></i>`));
     }
     const months = [];
     for (let m = 0; m < 12; m++) {

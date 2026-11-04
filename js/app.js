@@ -4,8 +4,8 @@ import { html, debounce, inputToDay, formatNumber, formatDay, formatDate, todayS
 import { icon } from './icons.js';
 import { parseFile } from './parser.js';
 import { emptyDataset, mergeEntries, buildBackup } from './dataset.js';
-import { buildModel, defaultSettings, normalizeSettings, artistKeyOf } from './model.js';
-import { computeStats, computeRanks, parsePeriod, encodePeriod, periodRange, previousRange, trackDetail, artistDetail } from './stats.js';
+import { buildModel, defaultSettings, normalizeSettings, artistKeyOf, resolveAlias, findMergeCandidates } from './model.js';
+import { computeStats, computeRanks, computeHighlights, parsePeriod, encodePeriod, periodRange, previousRange, trackDetail, artistDetail, dayDetail } from './stats.js';
 import { getValue, setValues, clearAll, readLegacyEntries } from './store.js';
 import * as V from './views.js';
 
@@ -13,22 +13,31 @@ const state = {
     dataset: null,
     settings: defaultSettings(),
     imports: [],
+    channelImages: {},
     model: null,
     stats: null,
     prev: null,
+    range: { start: null, end: null },
     period: { type: 'all' },
     periodLabel: '',
     tab: 'overview',
     rankType: 'songs',
+    rankSort: 'count',
     search: '',
     rankLimit: 100,
     calYear: null,
     summaryYear: null,
     discoverType: 'artists',
-    detail: null, // { type: 'song'|'artist', key, limit }
+    cmpA: null,
+    cmpB: null,
+    cmpType: 'songs',
+    detail: null, // { type: 'song'|'artist'|'day', key, limit }
     busy: false,
+    apiBusy: false,
+    persisted: null,
     searchCache: { songs: new Map(), artists: new Map() },
-    summaryCache: new Map(),
+    timeRankCache: {},
+    cache: new Map(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -37,7 +46,7 @@ const els = {};
 // --- 起動 ---
 
 async function init() {
-    for (const id of ['header-controls', 'tabs', 'main', 'detail', 'toasts', 'tooltip', 'drop-overlay', 'busy', 'file-input', 'theme-btn', 'to-top', 'artist-options', 'detail-content']) {
+    for (const id of ['header-controls', 'tabs', 'main', 'detail', 'detail-content', 'toasts', 'tooltip', 'drop-overlay', 'busy', 'file-input', 'theme-btn', 'to-top', 'artist-options', 'song-options']) {
         els[id] = $(id);
     }
     applyTheme(readTheme());
@@ -45,17 +54,19 @@ async function init() {
     readHash();
 
     try {
-        const [dataset, settings, imports, meta] = await Promise.all([
-            getValue('dataset'), getValue('settings'), getValue('imports'), getValue('meta'),
+        const [dataset, settings, imports, meta, channelImages] = await Promise.all([
+            getValue('dataset'), getValue('settings'), getValue('imports'), getValue('meta'), getValue('channelImages'),
         ]);
         state.settings = normalizeSettings(settings);
         state.imports = Array.isArray(imports) ? imports : [];
+        state.channelImages = channelImages && typeof channelImages === 'object' ? channelImages : {};
         state.dataset = dataset && dataset.times && dataset.times.length ? dataset : null;
         if (!meta || !meta.legacyChecked) await migrateLegacy();
     } catch (err) {
         console.error(err);
         toast(`保存データを開けませんでした: ${err.message}`, 'error');
     }
+    await checkPersisted();
     rebuild();
     render();
 }
@@ -74,18 +85,47 @@ async function migrateLegacy() {
     }
 }
 
+// --- 保存データの保護 ---
+
+async function checkPersisted() {
+    try {
+        state.persisted = navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted() : null;
+    } catch {
+        state.persisted = null;
+    }
+}
+
+async function requestPersist(silent = false) {
+    if (!navigator.storage || !navigator.storage.persist) return;
+    try {
+        state.persisted = await navigator.storage.persist();
+        if (!silent) {
+            toast(state.persisted ? '保存データを保護しました。' : 'ブラウザに保護を許可されませんでした。このサイトをブックマークするなど、よく使うと許可されやすくなります。', state.persisted ? 'info' : 'error');
+        }
+    } catch {
+        /* 対応していないブラウザ */
+    }
+}
+
 // --- 状態の再計算 ---
 
 function rebuild() {
     state.searchCache = { songs: new Map(), artists: new Map() };
-    state.summaryCache = new Map();
+    state.cache = new Map();
+    els['artist-options'].innerHTML = '';
+    els['song-options'].innerHTML = '';
     if (!state.dataset) {
         state.model = null;
         state.stats = null;
         return;
     }
     state.model = buildModel(state.dataset, state.settings);
-    if (state.summaryYear == null || !state.model.years.includes(state.summaryYear)) state.summaryYear = state.model.years[0] ?? null;
+    const years = state.model.years;
+    if (state.summaryYear == null || !years.includes(state.summaryYear)) state.summaryYear = years[0] ?? null;
+    if (!state.cmpA || !state.cmpB) {
+        state.cmpB = years.length ? { type: 'year', year: years[0] } : { type: 'all' };
+        state.cmpA = years.length > 1 ? { type: 'year', year: years[1] } : { type: 'all' };
+    }
     recompute();
 }
 
@@ -95,11 +135,22 @@ function recompute() {
     const range = periodRange(period, model);
     state.range = range;
     state.stats = computeStats(model, range);
+    state.timeRankCache = {};
     const prev = previousRange(period, model);
     state.prev = prev && prev.end >= model.minDay ? computeRanks(model, prev) : null;
     if (state.prev && !state.prev.total) state.prev = null;
     state.periodLabel = periodLabel();
     state.rankLimit = 100;
+}
+
+/** 期間ごとの集計をキャッシュして返す */
+function cached(key, fn) {
+    if (!state.cache.has(key)) state.cache.set(key, fn());
+    return state.cache.get(key);
+}
+
+function statsFor(period) {
+    return cached(`stats:${encodePeriod(period)}`, () => computeStats(state.model, periodRange(period, state.model)));
 }
 
 function periodLabel() {
@@ -120,6 +171,8 @@ function readHash() {
     const tab = params.get('tab');
     state.tab = V.TABS.some(([k]) => k === tab) ? tab : 'overview';
     state.period = parsePeriod(params.get('p'));
+    if (params.get('a')) state.cmpA = parsePeriod(params.get('a'));
+    if (params.get('b')) state.cmpB = parsePeriod(params.get('b'));
 }
 
 function writeHash() {
@@ -127,6 +180,10 @@ function writeHash() {
     if (state.tab !== 'overview') params.set('tab', state.tab);
     const p = encodePeriod(state.period);
     if (p !== 'all') params.set('p', p);
+    if (state.tab === 'compare' && state.cmpA && state.cmpB) {
+        params.set('a', encodePeriod(state.cmpA));
+        params.set('b', encodePeriod(state.cmpB));
+    }
     const hash = params.toString();
     history.replaceState(null, '', hash ? `#${hash}` : location.pathname + location.search);
 }
@@ -148,7 +205,8 @@ function render() {
 }
 
 function renderHeader() {
-    if (!state.model || state.tab === 'summary') {
+    // 年間まとめと比較は、それぞれの画面で期間を選ぶ
+    if (!state.model || state.tab === 'summary' || state.tab === 'compare') {
         els['header-controls'].innerHTML = '';
         return;
     }
@@ -159,7 +217,8 @@ function renderMain() {
     let view;
     switch (state.tab) {
         case 'ranking': view = V.rankingView(state); break;
-        case 'trends': view = V.trendsView(state); break;
+        case 'trends': view = V.trendsView(state, cached(`hl:${encodePeriod(state.period)}`, () => computeHighlights(state.model, state.stats))); break;
+        case 'compare': view = V.compareView(state, statsFor(state.cmpA), statsFor(state.cmpB)); break;
         case 'summary': view = V.summaryView(state, ...summaryStats()); break;
         case 'data': view = V.dataView(state); break;
         default: view = V.overviewView(state);
@@ -170,12 +229,9 @@ function renderMain() {
 function summaryStats() {
     const y = state.summaryYear;
     if (y == null) return [null, 0];
-    if (!state.summaryCache.has(y)) {
-        const s = computeStats(state.model, periodRange({ type: 'year', year: y }, state.model));
-        const prev = computeRanks(state.model, periodRange({ type: 'year', year: y - 1 }, state.model));
-        state.summaryCache.set(y, [s, prev.total]);
-    }
-    return state.summaryCache.get(y);
+    const s = statsFor({ type: 'year', year: y });
+    const prev = cached(`ranks:y${y - 1}`, () => computeRanks(state.model, periodRange({ type: 'year', year: y - 1 }, state.model)));
+    return [s, prev.total];
 }
 
 const updateRankingList = () => {
@@ -202,28 +258,39 @@ function renderDetail() {
     const { model, stats } = state;
     let content;
     if (d.type === 'song') {
-        const ti = model.tracks.findIndex((t) => t.key === d.key);
-        if (ti < 0) return closeDetail();
+        let ti = model.tracks.findIndex((t) => t.key === d.key);
+        if (ti < 0) {
+            // まとめた結果キーが変わった場合はまとめ先を開く
+            const to = resolveAlias(state.settings.trackAliases, d.key);
+            ti = model.tracks.findIndex((t) => t.key === to);
+            if (ti < 0) return closeDetail();
+            d.key = to;
+        }
         const rank = stats.songs.find((x) => x.i === ti)?.rank;
         content = V.songDetailView(state, ti, trackDetail(model, ti, state.range), rank);
-    } else {
+        if (!els['song-options'].childElementCount) els['song-options'].innerHTML = String(V.songOptions(state));
+    } else if (d.type === 'artist') {
         let ai = model.artists.findIndex((a) => a.key === d.key);
         if (ai < 0) {
-            // まとめた結果キーが変わった場合はまとめ先を開く
-            const ali = state.settings.aliases[d.key];
-            ai = ali ? model.artists.findIndex((a) => a.key === ali) : -1;
+            const to = resolveAlias(state.settings.aliases, d.key);
+            ai = model.artists.findIndex((a) => a.key === to);
             if (ai < 0) return closeDetail();
-            d.key = model.artists[ai].key;
+            d.key = to;
         }
         const rank = stats.artists.find((x) => x.i === ai)?.rank;
         content = V.artistDetailView(state, ai, artistDetail(model, ai, state.range), rank, stats.total);
         if (!els['artist-options'].childElementCount) els['artist-options'].innerHTML = String(V.artistOptions(state));
+    } else {
+        const day = Number(d.key);
+        content = V.dayDetailView(state, day, dayDetail(model, day));
     }
     const box = els['detail-content'];
+    const keepScroll = d.keepScroll;
     const scroll = box.querySelector('.detail__body')?.scrollTop || 0;
     box.innerHTML = String(content);
     const body = box.querySelector('.detail__body');
-    if (body) body.scrollTop = scroll;
+    if (body && keepScroll) body.scrollTop = scroll;
+    d.keepScroll = false;
 }
 
 function closeDetail() {
@@ -237,15 +304,74 @@ async function updateSettings(mutate, message) {
     const next = normalizeSettings(state.settings);
     mutate(next);
     state.settings = next;
-    els['artist-options'].innerHTML = '';
     rebuild();
     render();
-    if (state.detail) renderDetail();
+    if (state.detail) { state.detail.keepScroll = true; renderDetail(); }
     try {
         await setValues({ settings: next });
         if (message) toast(message);
     } catch (err) {
         toast(`設定を保存できませんでした: ${err.message}`, 'error');
+    }
+}
+
+// --- アーティスト画像（YouTube Data API） ---
+
+async function fetchChannelImages({ quiet = false } = {}) {
+    const key = state.settings.youtubeApiKey;
+    if (!key || !state.model || state.apiBusy) return;
+    // 再生の多いアーティストから順に取得する
+    const totals = new Map();
+    state.model.tracks.forEach((t, ti) => totals.set(t.artistIdx, (totals.get(t.artistIdx) || 0) + state.model.trackTotal[ti]));
+    const ids = [...new Set(state.model.artists
+        .map((a, ai) => ({ id: a.channelId, n: totals.get(ai) || 0 }))
+        .filter((x) => x.id && !(x.id in state.channelImages))
+        .sort((a, b) => b.n - a.n)
+        .map((x) => x.id))];
+    if (!ids.length) {
+        if (!quiet) toast('新しく取得するアイコンはありません。');
+        return;
+    }
+    state.apiBusy = true;
+    if (state.tab === 'data') renderMain();
+    let got = 0;
+    try {
+        for (let k = 0; k < ids.length; k += 50) {
+            const batch = ids.slice(k, k + 50);
+            const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet&maxResults=50&fields=items(id,snippet/thumbnails)&id=${batch.join(',')}`;
+            const res = await fetch(url, { headers: { 'X-Goog-Api-Key': key } });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                const reason = body?.error?.errors?.[0]?.reason || body?.error?.status || res.status;
+                throw new Error(apiErrorText(reason, body?.error?.message));
+            }
+            const found = new Map((body.items || []).map((it) => {
+                const th = it.snippet?.thumbnails || {};
+                return [it.id, (th.medium || th.default || th.high || {}).url || ''];
+            }));
+            for (const id of batch) {
+                state.channelImages[id] = found.get(id) || '';
+                if (found.get(id)) got++;
+            }
+            await setValues({ channelImages: state.channelImages });
+        }
+        if (!quiet) toast(`${formatNumber(got)}件のアイコンを取得しました。`);
+    } catch (err) {
+        toast(`アイコンを取得できませんでした: ${err.message}`, 'error', 10000);
+    } finally {
+        state.apiBusy = false;
+        render();
+        if (state.detail) { state.detail.keepScroll = true; renderDetail(); }
+    }
+}
+
+function apiErrorText(reason, message) {
+    switch (reason) {
+        case 'keyInvalid': case 'badRequest': case 'API_KEY_INVALID': return 'API キーが正しくありません。';
+        case 'quotaExceeded': case 'dailyLimitExceeded': return '今日の利用上限に達しました。明日もう一度試してください。';
+        case 'accessNotConfigured': case 'SERVICE_DISABLED': return 'YouTube Data API v3 が有効になっていません。';
+        case 'forbidden': case 'PERMISSION_DENIED': return 'このページからの利用が許可されていません。キーの制限（ウェブサイト）を確認してください。';
+        default: return message || String(reason);
     }
 }
 
@@ -299,10 +425,12 @@ async function parseInBackground(name, buffer) {
 
 function mergeSettings(a, b) {
     return normalizeSettings({
+        ...a,
         excludedArtists: [...a.excludedArtists, ...b.excludedArtists],
         excludedTracks: [...a.excludedTracks, ...b.excludedTracks],
         aliases: { ...b.aliases, ...a.aliases },
-        showThumbnails: a.showThumbnails,
+        trackAliases: { ...b.trackAliases, ...a.trackAliases },
+        ignoredSuggestions: [...a.ignoredSuggestions, ...b.ignoredSuggestions],
     });
 }
 
@@ -347,11 +475,13 @@ async function importFiles(fileList) {
             state.settings = settings;
             setBusy('保存しています…');
             await setValues({ dataset, imports: state.imports, ...(settingsChanged ? { settings } : {}) });
-            els['artist-options'].innerHTML = '';
             rebuild();
             render();
             if (added) toast(`${formatNumber(added)}件の再生記録を追加しました${duplicates ? `（重複 ${formatNumber(duplicates)}件は除外）` : ''}。`);
             else toast('新しい再生記録はありませんでした（すべて保存済みのデータと重複）。');
+            // 大きなデータを保存したので、ブラウザに消されないよう保護を求める
+            if (!state.persisted) requestPersist(true).then(() => { if (state.tab === 'data') renderMain(); });
+            if (state.settings.youtubeApiKey) fetchChannelImages({ quiet: true });
         }
     } catch (err) {
         console.error(err);
@@ -391,22 +521,23 @@ function exportCsv(type) {
     const { model, stats } = state;
     if (!stats) return;
     const rows = [];
+    const minutes = (ms) => (ms / 60000).toFixed(1);
     if (type === 'artists') {
         const songsPer = new Map();
         for (const x of stats.songs) {
             const ai = model.tracks[x.i].artistIdx;
             songsPer.set(ai, (songsPer.get(ai) || 0) + 1);
         }
-        rows.push(['順位', 'アーティスト', '再生回数', '割合(%)', '曲数', 'URL']);
+        rows.push(['順位', 'アーティスト', '再生回数', '割合(%)', '推定再生時間(分)', '曲数', 'URL']);
         for (const x of stats.artists) {
             const a = model.artists[x.i];
-            rows.push([x.rank, a.name, x.count, ((x.count / stats.total) * 100).toFixed(2), songsPer.get(x.i) || 0, a.url || '']);
+            rows.push([x.rank, a.name, x.count, ((x.count / stats.total) * 100).toFixed(2), minutes(stats.artistMs[x.i]), songsPer.get(x.i) || 0, a.url || '']);
         }
     } else {
-        rows.push(['順位', '曲名', 'アーティスト', '再生回数', '初再生', 'URL']);
+        rows.push(['順位', '曲名', 'アーティスト', '再生回数', '推定再生時間(分)', '初再生', 'URL']);
         for (const x of stats.songs) {
             const t = model.tracks[x.i];
-            rows.push([x.rank, t.title, model.artists[t.artistIdx].name, x.count, formatDate(isFinite(model.trackFirst[x.i]) ? model.trackFirst[x.i] : null), t.v ? `https://music.youtube.com/watch?v=${t.v}` : '']);
+            rows.push([x.rank, t.title, model.artists[t.artistIdx].name, x.count, minutes(stats.trackMs[x.i]), formatDate(isFinite(model.trackFirst[x.i]) ? model.trackFirst[x.i] : null), t.v ? `https://music.youtube.com/watch?v=${t.v}` : '']);
         }
     }
     const csv = '﻿' + rows.map((r) => r.map(csvCell).join(',')).join('\r\n');
@@ -415,7 +546,9 @@ function exportCsv(type) {
 
 function exportBackup() {
     if (!state.dataset) return;
-    const json = JSON.stringify(buildBackup(state.dataset, state.settings));
+    // API キーはバックアップに含めない
+    const { youtubeApiKey, ...settings } = state.settings;
+    const json = JSON.stringify(buildBackup(state.dataset, settings));
     download(`ytm-history-backup_${todayStamp()}.json`, json, 'application/json');
 }
 
@@ -430,8 +563,11 @@ async function deleteAll() {
     }
     state.dataset = null;
     state.imports = [];
+    state.channelImages = {};
     state.settings = defaultSettings();
     state.period = { type: 'all' };
+    state.cmpA = null;
+    state.cmpB = null;
     state.tab = 'overview';
     closeDetail();
     rebuild();
@@ -452,6 +588,8 @@ function toast(message, kind = 'info', ms = 4000) {
     setTimeout(() => el.remove(), ms);
 }
 
+let tipTarget = null;
+
 function showTip(target) {
     const tip = target.getAttribute('data-tip');
     if (!tip) return;
@@ -465,29 +603,34 @@ function showTip(target) {
     let y = r.top - th - 8;
     if (y < 8) y = r.bottom + 8;
     t.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+    tipTarget?.classList.remove('is-hover');
     target.classList.add('is-hover');
-    showTip.current?.classList.remove('is-hover');
-    showTip.current = target;
+    tipTarget = target;
 }
 
 function hideTip() {
     els.tooltip.hidden = true;
-    showTip.current?.classList.remove('is-hover');
-    showTip.current = null;
+    tipTarget?.classList.remove('is-hover');
+    tipTarget = null;
 }
 
 const THEMES = ['auto', 'light', 'dark'];
 const THEME_LABEL = { auto: '端末の設定に合わせる', light: 'ライト', dark: 'ダーク' };
 
 function readTheme() {
-    try { return THEMES.includes(localStorage.getItem('theme')) ? localStorage.getItem('theme') : 'auto'; } catch { return 'auto'; }
+    try {
+        const v = localStorage.getItem('theme');
+        return THEMES.includes(v) ? v : 'auto';
+    } catch {
+        return 'auto';
+    }
 }
 
 function applyTheme(theme) {
     if (theme === 'auto') delete document.documentElement.dataset.theme;
     else document.documentElement.dataset.theme = theme;
     els['theme-btn'].innerHTML = String(icon(theme === 'auto' ? 'auto' : theme === 'light' ? 'sun' : 'moon'));
-    els['theme-btn'].setAttribute('aria-label', `テーマ: ${THEME_LABEL[theme]}（クリックで切り替え）`);
+    els['theme-btn'].setAttribute('aria-label', `テーマ: ${THEME_LABEL[theme]}（押すと切り替え）`);
     els['theme-btn'].title = `テーマ: ${THEME_LABEL[theme]}`;
     els['theme-btn'].dataset.theme = theme;
 }
@@ -508,7 +651,7 @@ function bindEvents() {
 
     document.addEventListener('pointerover', (e) => {
         const t = e.target.closest('[data-tip]');
-        if (t) showTip(t); else if (showTip.current) hideTip();
+        if (t) showTip(t); else if (tipTarget) hideTip();
     });
     document.addEventListener('pointerdown', (e) => {
         if (!e.target.closest('[data-tip]')) hideTip();
@@ -518,12 +661,16 @@ function bindEvents() {
         els['to-top'].classList.toggle('is-visible', window.scrollY > 600);
     }, { passive: true });
 
-    // 画像が読めないときは代わりのアイコンにする
+    // 画像が読めないときは代わりの表示にする
     document.addEventListener('error', (e) => {
         const img = e.target;
-        if (img.tagName === 'IMG' && img.parentElement?.classList.contains('thumb')) {
-            img.parentElement.classList.add('thumb--empty');
+        if (img.tagName !== 'IMG') return;
+        const box = img.parentElement;
+        if (box?.classList.contains('thumb')) {
+            box.classList.add('thumb--empty');
             img.replaceWith(document.createRange().createContextualFragment(String(icon('music'))));
+        } else if (box?.classList.contains('avatar')) {
+            img.replaceWith(document.createTextNode(box.dataset.initial || '?'));
         }
     }, true);
 
@@ -595,6 +742,11 @@ function onClick(e) {
             state.rankLimit = 100;
             renderMain();
             break;
+        case 'rank-sort':
+            state.rankSort = value;
+            state.rankLimit = 100;
+            renderMain();
+            break;
         case 'more':
             state.rankLimit += 100;
             updateRankingList();
@@ -610,11 +762,17 @@ function onClick(e) {
             state.discoverType = value;
             renderMain();
             break;
+        case 'cmp-type':
+            state.cmpType = value;
+            renderMain();
+            break;
         case 'open-song': openDetail('song', key); break;
         case 'open-artist': openDetail('artist', key); break;
+        case 'open-day': if (value !== undefined && value !== '') openDetail('day', value); break;
         case 'close-detail': closeDetail(); break;
         case 'detail-more':
             state.detail.limit += 200;
+            state.detail.keepScroll = true;
             renderDetail();
             break;
         case 'copy':
@@ -638,6 +796,34 @@ function onClick(e) {
         case 'unalias':
             updateSettings((s) => { delete s.aliases[key]; }, 'まとめを解除しました。');
             break;
+        case 'untrack-alias':
+            updateSettings((s) => { delete s.trackAliases[key]; }, '曲のまとめを解除しました。');
+            break;
+        case 'merge-candidate': {
+            const [main, ...rest] = value.split('\n');
+            updateSettings((s) => { for (const k of rest) s.trackAliases[k] = main; }, `${rest.length + 1}件の曲を 1 つにまとめました。`);
+            break;
+        }
+        case 'merge-all-candidates': {
+            const groups = findMergeCandidates(state.model, state.settings.ignoredSuggestions)
+                .map((c) => c.tracks.map((ti) => state.model.tracks[ti].key));
+            if (!confirm(`${formatNumber(groups.length)}組の候補をすべてまとめます。よろしいですか？（あとから個別に解除できます）`)) break;
+            updateSettings((s) => { for (const [main, ...rest] of groups) for (const k of rest) s.trackAliases[k] = main; }, `${formatNumber(groups.length)}組の曲をまとめました。`);
+            break;
+        }
+        case 'ignore-candidate':
+            updateSettings((s) => { s.ignoredSuggestions.push(key); });
+            break;
+        case 'reset-ignored':
+            updateSettings((s) => { s.ignoredSuggestions = []; });
+            break;
+        case 'persist':
+            requestPersist().then(() => renderMain());
+            break;
+        case 'fetch-images': fetchChannelImages(); break;
+        case 'clear-api-key':
+            updateSettings((s) => { s.youtubeApiKey = ''; }, 'API キーを削除しました。');
+            break;
         case 'add-files': els['file-input'].click(); break;
         case 'export-backup': exportBackup(); break;
         case 'export-csv': exportCsv(value); break;
@@ -652,42 +838,83 @@ function onClick(e) {
     }
 }
 
+function customFrom(a, b) {
+    if (a == null || b == null) return null;
+    return { type: 'custom', start: Math.min(a, b), end: Math.max(a, b) };
+}
+
+function defaultCustom() {
+    const end = state.model.maxDay;
+    return { type: 'custom', start: Math.max(state.model.minDay, end - 29), end };
+}
+
 function onChange(e) {
     const t = e.target;
     if (t.id === 'period-select') {
-        const v = t.value;
-        if (v === 'custom') {
-            const end = state.model.maxDay;
-            state.period = { type: 'custom', start: Math.max(state.model.minDay, end - 29), end };
-        } else {
-            state.period = parsePeriod(v);
-        }
+        state.period = t.value === 'custom' ? defaultCustom() : parsePeriod(t.value);
         recompute();
         render();
     } else if (t.id === 'period-start' || t.id === 'period-end') {
-        const a = inputToDay($('period-start').value);
-        const b = inputToDay($('period-end').value);
-        if (a == null || b == null) return;
-        state.period = { type: 'custom', start: Math.min(a, b), end: Math.max(a, b) };
+        const p = customFrom(inputToDay($('period-start').value), inputToDay($('period-end').value));
+        if (!p) return;
+        state.period = p;
         recompute();
+        render();
+    } else if (t.dataset.periodSelect) {
+        const p = t.value === 'custom' ? defaultCustom() : parsePeriod(t.value);
+        if (t.dataset.periodSelect === 'cmp-a') state.cmpA = p; else state.cmpB = p;
+        render();
+    } else if (t.dataset.periodStart || t.dataset.periodEnd) {
+        const id = t.dataset.periodStart || t.dataset.periodEnd;
+        const p = customFrom(
+            inputToDay(document.querySelector(`[data-period-start="${id}"]`).value),
+            inputToDay(document.querySelector(`[data-period-end="${id}"]`).value),
+        );
+        if (!p) return;
+        if (id === 'cmp-a') state.cmpA = p; else state.cmpB = p;
         render();
     } else if (t.dataset.action === 'toggle-thumbs') {
         updateSettings((s) => { s.showThumbnails = t.checked; });
+    } else if (t.dataset.action === 'toggle-skips') {
+        updateSettings((s) => { s.excludeSkips = t.checked; }, t.checked ? 'スキップした再生を集計から除外しました。' : 'スキップした再生も集計に含めました。');
     }
 }
 
 function onSubmit(e) {
     const form = e.target;
-    if (form.dataset.form !== 'merge') return;
+    const kind = form.dataset.form;
+    if (!kind) return;
     e.preventDefault();
-    const name = new FormData(form).get('target').trim();
+    const data = new FormData(form);
+
+    if (kind === 'api-key') {
+        const key = String(data.get('key') || '').trim();
+        updateSettings((s) => { s.youtubeApiKey = key; }, key ? 'API キーを保存しました。' : 'API キーを削除しました。')
+            .then(() => { if (key) fetchChannelImages(); });
+        return;
+    }
+
+    const name = String(data.get('target') || '').trim();
     const fromKey = form.dataset.key;
-    const target = state.model.artists.find((a) => a.name === name)
-        || state.model.artists.find((a) => a.key === artistKeyOf(name));
-    if (!target) { toast(`「${name}」というアーティストは見つかりません。候補から選んでください。`, 'error'); return; }
-    if (target.key === fromKey) { toast('同じアーティストです。', 'error'); return; }
-    state.detail.key = target.key;
-    updateSettings((s) => { s.aliases[fromKey] = target.key; }, `「${target.name}」にまとめました。`);
+    if (kind === 'merge') {
+        const target = state.model.artists.find((a) => a.name === name)
+            || state.model.artists.find((a) => a.key === artistKeyOf(name));
+        if (!target) { toast(`「${name}」というアーティストは見つかりません。候補から選んでください。`, 'error'); return; }
+        if (target.key === fromKey) { toast('同じアーティストです。', 'error'); return; }
+        state.detail.key = target.key;
+        updateSettings((s) => { s.aliases[fromKey] = target.key; }, `「${target.name}」にまとめました。`);
+    } else if (kind === 'merge-track') {
+        const ti = state.model.tracks.findIndex((_, i) => V.songOptionLabel(state, i) === name);
+        if (ti < 0) { toast(`「${name}」という曲は見つかりません。候補から選んでください。`, 'error'); return; }
+        const target = state.model.tracks[ti];
+        if (target.key === fromKey) { toast('同じ曲です。', 'error'); return; }
+        state.detail.key = target.key;
+        updateSettings((s) => {
+            s.trackAliases[fromKey] = target.key;
+            // まとめ元にまとめていた曲も、まとめ先へ向け直す
+            for (const [k, v] of Object.entries(s.trackAliases)) if (v === fromKey) s.trackAliases[k] = target.key;
+        }, `「${target.title}」にまとめました。`);
+    }
 }
 
 init();
