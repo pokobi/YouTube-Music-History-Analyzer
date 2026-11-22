@@ -38,6 +38,7 @@ export function defaultSettings() {
         showThumbnails: true,
         excludeSkips: false,
         youtubeApiKey: '',
+        fetchMeta: true,
     };
 }
 
@@ -55,6 +56,7 @@ export function normalizeSettings(s) {
         showThumbnails: s.showThumbnails !== false,
         excludeSkips: s.excludeSkips === true,
         youtubeApiKey: typeof s.youtubeApiKey === 'string' ? s.youtubeApiKey.trim() : '',
+        fetchMeta: s.fetchMeta !== false,
     };
 }
 
@@ -71,9 +73,15 @@ function median(values) {
     return s[Math.floor(s.length / 2)];
 }
 
-export function buildModel(dataset, settings) {
+/**
+ * @param meta 外部サービスから取得した原題など（enrich.js）。settings.fetchMeta が false なら使わない
+ */
+export function buildModel(dataset, settings, meta = null) {
     const { tracks: rawTracks, times } = dataset;
     const n = times.length;
+    const metaTracks = settings.fetchMeta !== false && meta ? meta.tracks || {} : {};
+    const metaArtists = settings.fetchMeta !== false && meta ? meta.artists || {} : {};
+    const metaOf = (t) => (t.v ? metaTracks[t.v] : null);
 
     // --- アーティスト（元の曲ごとに名前と URL を集める） ---
     const artistIndex = new Map();
@@ -82,7 +90,7 @@ export function buildModel(dataset, settings) {
         let ai = artistIndex.get(key);
         if (ai === undefined) {
             ai = artists.length;
-            artists.push({ key, name: null, url: null, urlIsTopic: true, nameScore: -Infinity, aliasNames: new Set(), imageV: null });
+            artists.push({ key, name: null, url: null, urlIsTopic: true, nameScore: -Infinity, aliasNames: new Set(), imageV: null, metaNames: new Map() });
             artistIndex.set(key, ai);
         }
         return ai;
@@ -98,6 +106,12 @@ export function buildModel(dataset, settings) {
             const score = (ownKey === a.key ? 1e15 : 0) + t.seen;
             if (score > a.nameScore) { a.name = disp; a.nameScore = score; }
         }
+        // 取得した原題のチャンネル名（「- Topic」の自動生成チャンネルのものだけを信頼する）
+        const m = metaOf(t);
+        if (m && m.a && TOPIC_RE.test(m.a)) {
+            const name = displayArtistName(m.a);
+            a.metaNames.set(name, (a.metaNames.get(name) || 0) + 1);
+        }
         if (t.artistUrl) {
             const isTopic = TOPIC_RE.test(t.artist || '');
             if (!a.url || (a.urlIsTopic && !isTopic)) { a.url = t.artistUrl; a.urlIsTopic = isTopic; }
@@ -106,6 +120,13 @@ export function buildModel(dataset, settings) {
     });
     for (const a of artists) {
         if (!a.name) a.name = a.key === 'a:?' ? UNKNOWN_ARTIST : a.key.slice(2);
+        // 日本語の名前: iTunes で確認できた名前 → Topic チャンネルの名前の順に使う
+        const itName = metaArtists[a.key]?.it?.name;
+        const topicName = a.metaNames.size && a.key !== 'a:?' ? [...a.metaNames.entries()].sort((x, y) => y[1] - x[1])[0][0] : null;
+        for (const best of [topicName, itName]) {
+            if (best && best !== a.name) { a.aliasNames.add(a.name); a.name = best; }
+        }
+        delete a.metaNames;
         a.aliasNames = [...a.aliasNames].filter((x) => x !== a.name);
         a.channelId = channelIdOf(a.url);
     }
@@ -126,7 +147,10 @@ export function buildModel(dataset, settings) {
         const tr = tracks[ti];
         tr.rawCount++;
         const score = (t.key === key ? 1e15 : 0) + t.seen;
-        const title = t.title || UNKNOWN_TITLE;
+        const m = metaOf(t);
+        // 曲名: iTunes の日本語表記 → YouTube の原題 → 書き出されたときの表記
+        const title = (m && (m.it || m.t)) || t.title || UNKNOWN_TITLE;
+        for (const other of [t.title, m && m.t]) if (other && other !== title) tr.variants.push(other);
         if (score > tr.score) {
             if (tr.title && tr.title !== title) tr.variants.push(tr.title);
             tr.score = score;

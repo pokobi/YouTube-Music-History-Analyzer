@@ -32,11 +32,12 @@ function initial(name) {
     return (Array.from(name || '?')[0] || '?').toUpperCase();
 }
 
-/** アーティストの画像（チャンネルのアイコン → いちばん聴いた曲のジャケット → 頭文字） */
+/** アーティストの画像（チャンネルのアイコン → Deezer の写真 → いちばん聴いた曲のジャケット → 頭文字） */
 export function avatar(state, a, size = '') {
     if (state.settings.showThumbnails) {
         const ch = a.channelId ? state.channelImages[a.channelId] : null;
-        const src = ch || (a.imageV ? `https://i.ytimg.com/vi/${a.imageV}/mqdefault.jpg` : null);
+        const dz = state.settings.fetchMeta ? state.extMeta.artists[a.key]?.img : null;
+        const src = ch || dz || (a.imageV ? `https://i.ytimg.com/vi/${a.imageV}/mqdefault.jpg` : null);
         if (src) {
             return html`<span class="avatar ${size}" aria-hidden="true" data-initial="${initial(a.name)}"><img src="${src}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer"></span>`;
         }
@@ -538,6 +539,9 @@ export function dataView(state) {
     const allCandidates = findMergeCandidates(model, settings.ignoredSuggestions);
     const candidates = allCandidates.slice(0, 30);
     const channelCount = new Set(model.artists.map((a) => a.channelId).filter(Boolean)).size;
+    const metaStats = { videos: new Set(state.dataset.tracks.map((t) => t.v).filter(Boolean)).size, titles: 0, failed: 0, images: 0 };
+    for (const v of Object.values(state.extMeta.tracks)) { if (v.t) metaStats.titles++; else metaStats.failed++; }
+    for (const v of Object.values(state.extMeta.artists)) { if (v.img) metaStats.images++; else metaStats.failed++; }
     const fetched = Object.values(state.channelImages).filter(Boolean).length;
 
     return html`
@@ -581,8 +585,25 @@ export function dataView(state) {
             `)}
         </div>
 
-        ${card('アーティスト画像', html`
-            <p class="lead">ふだんは、そのアーティストのいちばん聴いた曲のジャケットを表示します。YouTube Data API のキーを入れると、チャンネルのアイコンを取得して表示します。</p>
+        ${card('曲の原題とアーティスト画像', html`
+            <label class="switch">
+                <input type="checkbox" data-action="toggle-meta" ${settings.fetchMeta ? 'checked' : ''}>
+                <span>外部サービスから曲の原題とアーティスト画像を取得する</span>
+            </label>
+            <div class="status-row">
+                <span class="status">${state.enrich ? `${state.enrich.label}を取得中 ${formatNumber(state.enrich.done)} / ${formatNumber(state.enrich.total)}` : `曲名 ${formatNumber(metaStats.titles)} / ${formatNumber(metaStats.videos)} 曲、アーティスト画像 ${formatNumber(metaStats.images)} 組を取得済み`}</span>
+                ${settings.fetchMeta && !state.enrich && metaStats.failed ? html`<button type="button" class="btn btn--small" data-action="retry-meta">取得できなかったものを再試行（${formatNumber(metaStats.failed)}件）</button>` : ''}
+            </div>
+            <p class="note">英語やローマ字で書き出された曲名を、YouTube に登録されている元の表記（原題）に置き換えます。書き出されたときの表記は「別の表記」として残り、検索にも使えます。</p>
+            <ul class="notes">
+                <li>曲名とアーティスト名: YouTube（動画 ID を送信）。取れない曲は iTunes Search API（曲名とアーティスト名を送信）で補い、アーティストが一致した場合だけ使います。</li>
+                <li>アーティスト画像: Deezer（アーティスト名を送信）。名前が一致した場合だけ使います。</li>
+                <li>オフにすると問い合わせを止め、書き出されたときの表記で表示します。</li>
+            </ul>
+        `)}
+
+        ${card('チャンネルのアイコン（YouTube Data API）', html`
+            <p class="lead">YouTube Data API のキーを入れると、アーティストのチャンネルのアイコンを取得して、ほかの画像より優先して表示します。曲名の取得も API でまとめて行うため速くなります。</p>
             <form class="key-form" data-form="api-key">
                 <input type="password" name="key" placeholder="YouTube Data API キー" value="${settings.youtubeApiKey}" autocomplete="off" spellcheck="false" aria-label="YouTube Data API キー">
                 <button type="submit" class="btn">保存</button>

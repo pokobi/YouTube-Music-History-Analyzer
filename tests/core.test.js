@@ -215,3 +215,100 @@ test('集中して聴いた期間と 1 日の詳細', () => {
     const h = computeHighlights(model, s, { minPlays: 2 });
     assert.equal(h.bursts[0].count, 3);
 });
+
+// --- 原題・画像の取得（照合ルール） ---
+
+import { nameKey, isVariantTitle, pickItunes, pickDeezerArtist, needsFetch, RETRY_MS } from '../js/enrich.js';
+
+test('名前の照合キーと、別の版の判定', () => {
+    assert.equal(nameKey('Kenshi Yonezu - Topic'), nameKey('kenshi yonezu'));
+    assert.equal(nameKey('藤井 風'), nameKey('藤井風'));
+    assert.ok(isVariantTitle('夜に駆ける (Piano Ver.)'));
+    assert.ok(isVariantTitle('Into The Night (English Version)'));
+    assert.ok(isVariantTitle('夜に駆ける - From THE FIRST TAKE'));
+    assert.ok(!isVariantTitle('夜に駆ける'));
+    assert.ok(!isVariantTitle('Lemon'));
+});
+
+test('iTunes の候補は、アーティストが一致し別の版でないものだけ採用する', () => {
+    const results = [
+        { trackName: '夜に駆ける (Piano Ver.)', artistName: 'Piano Echoes' },
+        { trackName: '夜に駆ける - From THE FIRST TAKE', artistName: 'YOASOBI' },
+        { trackName: '夜に駆ける', artistName: 'YOASOBI' },
+    ];
+    assert.deepEqual(pickItunes(results, { title: 'Yoru ni Kakeru', artistNames: ['YOASOBI'] }), { title: '夜に駆ける', artist: 'YOASOBI' });
+    // アーティストが一致しなければ使わない
+    assert.equal(pickItunes(results, { title: 'Yoru ni Kakeru', artistNames: ['Ayase'] }), null);
+    // すでに同じ表記なら置き換えない
+    assert.equal(pickItunes([{ trackName: 'Lemon', artistName: '米津玄師' }], { title: 'Lemon', artistNames: ['Kenshi Yonezu', '米津玄師'] }), null);
+});
+
+test('Deezer の候補は名前が一致し、画像があるものだけ使う', () => {
+    const data = [
+        { name: 'YOASOBI', picture_medium: 'https://cdn/images/artist/abc/250x250.jpg', nb_fan: 10 },
+        { name: 'YOASOBI', picture_medium: 'https://cdn/images/artist//250x250.jpg', nb_fan: 99 },
+        { name: 'Yoasobi Cover', picture_medium: 'https://cdn/images/artist/zzz/250x250.jpg', nb_fan: 999 },
+    ];
+    assert.equal(pickDeezerArtist(data, ['YOASOBI']), 'https://cdn/images/artist/abc/250x250.jpg');
+    assert.equal(pickDeezerArtist(data, ['Ado']), '');
+});
+
+test('取得できなかったものは一定期間たってから再取得する', () => {
+    const now = Date.now();
+    assert.ok(needsFetch(undefined, now));
+    assert.ok(!needsFetch({ t: 'x', src: 'yt', at: 0 }, now));
+    assert.ok(!needsFetch({ t: null, src: 'none', at: now }, now));
+    assert.ok(needsFetch({ t: null, src: 'none', at: now - RETRY_MS - 1 }, now));
+});
+
+test('取得した原題とアーティスト名がモデルに反映される', () => {
+    const { dataset } = load();
+    const meta = {
+        tracks: {
+            aaaaaaaaaaa: { t: 'ソングA', a: 'アーティストX - Topic', src: 'yt', at: 1 },
+            bbbbbbbbbbb: { t: 'MV タイトル', a: 'Some Channel', src: 'yt', at: 1 },
+        },
+        artists: {},
+    };
+    const model = buildModel(dataset, defaultSettings(), meta);
+    const a = model.tracks.find((t) => t.v === 'aaaaaaaaaaa');
+    assert.equal(a.title, 'ソングA');
+    assert.ok(a.variants.includes('Song A'));
+    assert.equal(model.artists[a.artistIdx].name, 'アーティストX');
+    assert.ok(model.artists[a.artistIdx].aliasNames.includes('Artist X'));
+    // Topic 以外のチャンネル名ではアーティスト名を変えない
+    const b = model.tracks.find((t) => t.v === 'bbbbbbbbbbb');
+    assert.equal(model.artists[b.artistIdx].name, 'Artist Y');
+    // 設定でオフにすると元の表記
+    const off = buildModel(dataset, { ...defaultSettings(), fetchMeta: false }, meta);
+    assert.equal(off.tracks.find((t) => t.v === 'aaaaaaaaaaa').title, 'Song A');
+});
+
+test('iTunes はアーティスト ID が一致する曲だけを採用し、曲名と名前の優先順位を守る', () => {
+    const results = [
+        { trackName: 'マリーゴールド (Instrumental)', artistName: 'あいみょん', artistId: 1 },
+        { trackName: 'マリーゴールド', artistName: 'あいみょん', artistId: 1 },
+    ];
+    assert.deepEqual(pickItunes(results, { title: 'Marigold', artistId: 1 }), { title: 'マリーゴールド', artist: 'あいみょん' });
+    assert.equal(pickItunes(results, { title: 'Marigold', artistId: 2 }), null);
+
+    const { dataset } = load();
+    const meta = {
+        tracks: { aaaaaaaaaaa: { t: 'Song A (YT)', a: 'Artist X - Topic', src: 'yt', at: 1, it: 'ソングA', itAt: 1 } },
+        artists: { 'a:artist x': { it: { id: 1, name: 'アーティストX', at: 1 } } },
+    };
+    const model = buildModel(dataset, defaultSettings(), meta);
+    const a = model.tracks.find((t) => t.v === 'aaaaaaaaaaa');
+    assert.equal(a.title, 'ソングA');
+    assert.ok(a.variants.includes('Song A') && a.variants.includes('Song A (YT)'));
+    assert.equal(model.artists[a.artistIdx].name, 'アーティストX');
+});
+
+test('別の版の曲名は、別の版の候補にだけ置き換える', () => {
+    const results = [
+        { trackName: 'きらり', artistName: '藤井 風', artistId: 5 },
+        { trackName: 'きらり (Original Remix)', artistName: '藤井 風', artistId: 5 },
+    ];
+    assert.deepEqual(pickItunes(results, { title: 'Kirari (Original Remix)', artistId: 5 }), { title: 'きらり (Original Remix)', artist: '藤井 風' });
+    assert.equal(pickItunes(results.slice(0, 1), { title: 'Kirari (Original Remix)', artistId: 5 }), null);
+});

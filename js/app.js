@@ -5,6 +5,7 @@ import { icon } from './icons.js';
 import { parseFile } from './parser.js';
 import { emptyDataset, mergeEntries, buildBackup } from './dataset.js';
 import { buildModel, defaultSettings, normalizeSettings, artistKeyOf, resolveAlias, findMergeCandidates } from './model.js';
+import { emptyMeta, normalizeMeta, needsFetch, needsImage, needsItunesArtist, RETRY_MS, JA_RE, ASCII_RE, ytVideos, ytOembed, itunesSearch, itunesArtistSearch, deezerArtistSearch, pickItunes, pickDeezerArtist, runPool, sleep } from './enrich.js';
 import { computeStats, computeRanks, computeHighlights, parsePeriod, encodePeriod, periodRange, previousRange, trackDetail, artistDetail, dayDetail } from './stats.js';
 import { getValue, setValues, clearAll, readLegacyEntries } from './store.js';
 import * as V from './views.js';
@@ -14,6 +15,8 @@ const state = {
     settings: defaultSettings(),
     imports: [],
     channelImages: {},
+    extMeta: emptyMeta(),
+    enrich: null,
     model: null,
     stats: null,
     prev: null,
@@ -46,7 +49,7 @@ const els = {};
 // --- 起動 ---
 
 async function init() {
-    for (const id of ['header-controls', 'tabs', 'main', 'detail', 'detail-content', 'toasts', 'tooltip', 'drop-overlay', 'busy', 'file-input', 'theme-btn', 'to-top', 'artist-options', 'song-options']) {
+    for (const id of ['header-controls', 'tabs', 'main', 'detail', 'detail-content', 'toasts', 'tooltip', 'drop-overlay', 'busy', 'file-input', 'theme-btn', 'to-top', 'artist-options', 'song-options', 'enrich-status']) {
         els[id] = $(id);
     }
     applyTheme(readTheme());
@@ -54,12 +57,13 @@ async function init() {
     readHash();
 
     try {
-        const [dataset, settings, imports, meta, channelImages] = await Promise.all([
-            getValue('dataset'), getValue('settings'), getValue('imports'), getValue('meta'), getValue('channelImages'),
+        const [dataset, settings, imports, meta, channelImages, extMeta] = await Promise.all([
+            getValue('dataset'), getValue('settings'), getValue('imports'), getValue('meta'), getValue('channelImages'), getValue('extMeta'),
         ]);
         state.settings = normalizeSettings(settings);
         state.imports = Array.isArray(imports) ? imports : [];
         state.channelImages = channelImages && typeof channelImages === 'object' ? channelImages : {};
+        state.extMeta = normalizeMeta(extMeta);
         state.dataset = dataset && dataset.times && dataset.times.length ? dataset : null;
         if (!meta || !meta.legacyChecked) await migrateLegacy();
     } catch (err) {
@@ -69,6 +73,7 @@ async function init() {
     await checkPersisted();
     rebuild();
     render();
+    enrich();
 }
 
 /** 旧バージョンのデータを引き継ぐ（1 回だけ） */
@@ -119,7 +124,7 @@ function rebuild() {
         state.stats = null;
         return;
     }
-    state.model = buildModel(state.dataset, state.settings);
+    state.model = buildModel(state.dataset, state.settings, state.extMeta);
     const years = state.model.years;
     if (state.summaryYear == null || !years.includes(state.summaryYear)) state.summaryYear = years[0] ?? null;
     if (!state.cmpA || !state.cmpB) {
@@ -375,6 +380,260 @@ function apiErrorText(reason, message) {
     }
 }
 
+// --- 原題・アーティスト画像の取得（外部サービス） ---
+
+let enrichRun = 0;
+let enrichAgain = false;
+
+function setEnrichStatus() {
+    const el = els['enrich-status'];
+    if (!el) return;
+    const e = state.enrich;
+    el.hidden = !e;
+    if (e) el.textContent = `${e.label}を取得中 ${formatNumber(e.done)}/${formatNumber(e.total)}`;
+}
+
+function cancelEnrich() {
+    enrichRun++;
+    state.enrich = null;
+    setEnrichStatus();
+}
+
+const saveMeta = () => setValues({ extMeta: state.extMeta }).catch((err) => console.error(err));
+
+/** 入力中でなければ、取得した結果を画面に反映する */
+function refreshFromMeta(force = false) {
+    const active = document.activeElement;
+    if (!force && active && (active.tagName === 'INPUT' || active.tagName === 'SELECT')) return;
+    rebuild();
+    render();
+    if (state.detail) { state.detail.keepScroll = true; renderDetail(); }
+}
+
+async function enrich() {
+    if (!state.settings.fetchMeta || !state.model) return;
+    if (state.enrich) { enrichAgain = true; return; }
+    const run = ++enrichRun;
+    const stop = () => run !== enrichRun || !state.settings.fetchMeta || !state.dataset;
+    try {
+        await enrichTitles(stop);
+        if (!stop()) await enrichArtists(stop);
+        if (!stop()) await enrichItunes(stop);
+    } catch (err) {
+        console.error(err);
+    } finally {
+        if (run === enrichRun) {
+            state.enrich = null;
+            setEnrichStatus();
+            if (state.tab === 'data') renderMain();
+            if (enrichAgain) { enrichAgain = false; enrich(); }
+        }
+    }
+}
+
+async function enrichTitles(stop) {
+    const { dataset } = state;
+    const meta = state.extMeta;
+    // 再生の多い曲から順に問い合わせる
+    const counts = new Uint32Array(dataset.tracks.length);
+    for (let i = 0; i < dataset.trackIdx.length; i++) counts[dataset.trackIdx[i]]++;
+    const seen = new Set();
+    const items = dataset.tracks
+        .map((t, ri) => ({ v: t.v, title: t.title, artist: t.artist, n: counts[ri] }))
+        .filter((x) => x.v && !seen.has(x.v) && seen.add(x.v) && needsFetch(meta.tracks[x.v]))
+        .sort((a, b) => b.n - a.n);
+    if (!items.length) return;
+
+    state.enrich = { label: '曲名', done: 0, total: items.length };
+    setEnrichStatus();
+    const now = () => Date.now();
+    let sinceSave = 0;
+    const progress = (k = 1) => {
+        state.enrich.done += k;
+        setEnrichStatus();
+        sinceSave += k;
+        if (sinceSave >= 100) {
+            sinceSave = 0;
+            saveMeta();
+            refreshFromMeta();
+        }
+    };
+    let rest = items;
+
+    // 1. API キーがあれば YouTube Data API で 50 件ずつ
+    const key = state.settings.youtubeApiKey;
+    if (key) {
+        const missing = [];
+        let k = 0;
+        try {
+            for (; k < rest.length && !stop(); k += 50) {
+                const batch = rest.slice(k, k + 50);
+                const res = await ytVideos(batch.map((x) => x.v), key);
+                for (const x of batch) {
+                    const r = res.get(x.v);
+                    if (r && r.t) meta.tracks[x.v] = { ...(meta.tracks[x.v] || {}), t: r.t, a: r.a, src: 'yt', at: now() };
+                    else missing.push(x);
+                }
+                progress(batch.length - batch.filter((x) => missing.includes(x)).length);
+            }
+        } catch (err) {
+            toast(`YouTube Data API で曲名を取得できませんでした: ${apiErrorText(err.reason, err.message)} キーを使わない方法で続けます。`, 'error', 8000);
+        }
+        rest = [...missing, ...rest.slice(k)];
+    }
+
+    // 2. キー不要の oEmbed で 1 件ずつ
+    const failed = [];
+    let paused = false;
+    await runPool(rest, 4, async (x) => {
+        let r = null;
+        try {
+            r = await ytOembed(x.v);
+        } catch (err) {
+            if (err.rate) { paused = true; return; }
+        }
+        if (r && r.t) {
+            meta.tracks[x.v] = { ...(meta.tracks[x.v] || {}), t: r.t, a: r.a, src: 'yt', at: now() };
+            progress();
+        } else {
+            failed.push(x);
+        }
+    }, () => stop() || paused);
+    if (paused || stop()) { saveMeta(); refreshFromMeta(); return; }
+
+    for (const x of failed) meta.tracks[x.v] = { ...(meta.tracks[x.v] || {}), t: null, a: null, src: 'none', at: now() };
+    saveMeta();
+    refreshFromMeta();
+}
+
+/**
+ * 英字だけの曲名を iTunes（日本のストア）で日本語表記にする。
+ * アーティストごとに iTunes のアーティストを探し、曲の検索結果が同じアーティスト ID のときだけ採用する。
+ * 最初の数曲で表記が変わらないアーティスト（洋楽など）は、それ以上問い合わせない。
+ */
+async function enrichItunes(stop) {
+    refreshFromMeta(true);
+    const model = state.model;
+    const meta = state.extMeta;
+    const PROBE = 3;
+    const WAIT = 3100; // iTunes の回数制限（1 分あたり約 20 回）に合わせる
+
+    // アーティストごとに、英字だけでまだ確認していない曲を集める
+    const byArtist = new Map();
+    model.tracks.forEach((t, ti) => {
+        if (!t.v || !model.trackTotal[ti] || !ASCII_RE.test(t.title) || t.title === 'タイトル不明') return;
+        const m = meta.tracks[t.v];
+        if (m && m.it !== undefined && Date.now() - (m.itAt || 0) < RETRY_MS) return;
+        let list = byArtist.get(t.artistIdx);
+        if (!list) byArtist.set(t.artistIdx, (list = []));
+        list.push(ti);
+    });
+    const artists = [...byArtist.entries()]
+        .map(([ai, list]) => ({ a: model.artists[ai], list: list.sort((x, y) => model.trackTotal[y] - model.trackTotal[x]) }))
+        .filter(({ a }) => a.key !== 'a:?' && !(meta.artists[a.key]?.it?.skip && Date.now() - meta.artists[a.key].it.at < RETRY_MS))
+        .sort((x, y) => y.list.reduce((n, ti) => n + model.trackTotal[ti], 0) - x.list.reduce((n, ti) => n + model.trackTotal[ti], 0));
+    if (!artists.length) return;
+
+    state.enrich = { label: '日本語の曲名', done: 0, total: artists.reduce((n, x) => n + x.list.length, 0) };
+    setEnrichStatus();
+    let sinceRefresh = 0;
+    const ask = async (fn) => {
+        const r = await fn();
+        await sleep(WAIT);
+        return r;
+    };
+
+    try {
+        for (const { a, list } of artists) {
+            if (stop()) break;
+            const entry = meta.artists[a.key] || (meta.artists[a.key] = {});
+            // 1. アーティストを探す
+            if (needsItunesArtist(entry)) {
+                const found = await ask(() => itunesArtistSearch(a.name));
+                const top = found[0];
+                entry.it = top ? { id: top.artistId, cand: top.artistName, name: null, at: Date.now() } : { id: null, name: null, at: Date.now() };
+            }
+            if (!entry.it.id) {
+                state.enrich.done += list.length;
+                setEnrichStatus();
+                continue;
+            }
+            // 2. 曲ごとに探し、同じアーティスト ID の曲だけを採用する
+            let tried = 0, changed = 0;
+            for (const ti of list) {
+                if (stop()) break;
+                const t = model.tracks[ti];
+                const results = await ask(() => itunesSearch(`${t.title} ${a.name}`));
+                const pick = pickItunes(results, { title: t.title, artistId: entry.it.id });
+                const m = meta.tracks[t.v] || (meta.tracks[t.v] = {});
+                m.it = pick ? pick.title : '';
+                m.itAt = Date.now();
+                if (pick) {
+                    changed++;
+                    // 曲が一致したので、アーティストの日本語の名前も確かめられた
+                    if (JA_RE.test(pick.artist || '')) entry.it.name = pick.artist;
+                    else if (JA_RE.test(entry.it.cand || '')) entry.it.name = entry.it.cand;
+                }
+                tried++;
+                state.enrich.done++;
+                setEnrichStatus();
+                if (++sinceRefresh >= 10) { sinceRefresh = 0; saveMeta(); refreshFromMeta(); }
+                if (tried >= PROBE && !changed) {
+                    // 表記が変わらないアーティスト。残りは問い合わせない
+                    entry.it.skip = true;
+                    state.enrich.done += list.length - tried;
+                    setEnrichStatus();
+                    break;
+                }
+            }
+        }
+    } catch (err) {
+        if (!err.rate) throw err;
+        // 回数制限に達した。続きは次に開いたときに行う
+    }
+    saveMeta();
+    refreshFromMeta();
+}
+
+async function enrichArtists(stop) {
+    const model = state.model;
+    const meta = state.extMeta;
+    const totals = new Map();
+    model.tracks.forEach((t, ti) => totals.set(t.artistIdx, (totals.get(t.artistIdx) || 0) + model.trackTotal[ti]));
+    const items = model.artists
+        .map((a, ai) => ({ a, n: totals.get(ai) || 0 }))
+        .filter(({ a, n }) => n > 0 && a.key !== 'a:?' && needsImage(meta.artists[a.key]))
+        .sort((x, y) => y.n - x.n)
+        .map(({ a }) => a);
+    if (!items.length) return;
+
+    state.enrich = { label: 'アーティスト画像', done: 0, total: items.length };
+    setEnrichStatus();
+    let sinceSave = 0;
+    await runPool(items, 2, async (a) => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                const data = await deezerArtistSearch(a.name);
+                meta.artists[a.key] = { ...(meta.artists[a.key] || {}), img: pickDeezerArtist(data, [a.name, ...a.aliasNames]), imgAt: Date.now() };
+                break;
+            } catch (err) {
+                if (!err.rate) break;
+                await sleep(5000);
+            }
+        }
+        state.enrich.done++;
+        setEnrichStatus();
+        if (++sinceSave >= 40) {
+            sinceSave = 0;
+            saveMeta();
+            refreshFromMeta();
+        }
+        await sleep(250);
+    }, stop);
+    saveMeta();
+    refreshFromMeta();
+}
+
 // --- ファイルの読み込み ---
 
 let worker = null;
@@ -482,6 +741,7 @@ async function importFiles(fileList) {
             // 大きなデータを保存したので、ブラウザに消されないよう保護を求める
             if (!state.persisted) requestPersist(true).then(() => { if (state.tab === 'data') renderMain(); });
             if (state.settings.youtubeApiKey) fetchChannelImages({ quiet: true });
+            enrich();
         }
     } catch (err) {
         console.error(err);
@@ -563,7 +823,9 @@ async function deleteAll() {
     }
     state.dataset = null;
     state.imports = [];
+    cancelEnrich();
     state.channelImages = {};
+    state.extMeta = emptyMeta();
     state.settings = defaultSettings();
     state.period = { type: 'all' };
     state.cmpA = null;
@@ -821,6 +1083,13 @@ function onClick(e) {
             requestPersist().then(() => renderMain());
             break;
         case 'fetch-images': fetchChannelImages(); break;
+        case 'retry-meta':
+            // 取れなかったものの記録を消して、もう一度問い合わせる
+            for (const [k, v] of Object.entries(state.extMeta.tracks)) if (v.src === 'none') delete state.extMeta.tracks[k];
+            for (const [k, v] of Object.entries(state.extMeta.artists)) if (!v.img) delete state.extMeta.artists[k];
+            saveMeta().then(() => enrich());
+            toast('取得できなかったものを、もう一度問い合わせます。');
+            break;
         case 'clear-api-key':
             updateSettings((s) => { s.youtubeApiKey = ''; }, 'API キーを削除しました。');
             break;
@@ -875,6 +1144,10 @@ function onChange(e) {
         render();
     } else if (t.dataset.action === 'toggle-thumbs') {
         updateSettings((s) => { s.showThumbnails = t.checked; });
+    } else if (t.dataset.action === 'toggle-meta') {
+        if (!t.checked) cancelEnrich();
+        updateSettings((s) => { s.fetchMeta = t.checked; }, t.checked ? '曲の原題とアーティスト画像の取得を有効にしました。' : '外部サービスへの問い合わせを止め、元の表記に戻しました。')
+            .then(() => { if (t.checked) enrich(); });
     } else if (t.dataset.action === 'toggle-skips') {
         updateSettings((s) => { s.excludeSkips = t.checked; }, t.checked ? 'スキップした再生を集計から除外しました。' : 'スキップした再生も集計に含めました。');
     }
