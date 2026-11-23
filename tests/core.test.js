@@ -312,3 +312,59 @@ test('別の版の曲名は、別の版の候補にだけ置き換える', () =>
     assert.deepEqual(pickItunes(results, { title: 'Kirari (Original Remix)', artistId: 5 }), { title: 'きらり (Original Remix)', artist: '藤井 風' });
     assert.equal(pickItunes(results.slice(0, 1), { title: 'Kirari (Original Remix)', artistId: 5 }), null);
 });
+
+import { pickItunesArtist, itunesArtistGroups, findItunesArtistByTrack, needsItunesArtist, ITUNES_VERSION } from '../js/enrich.js';
+
+// iTunes の「アーティスト名での曲検索」の結果（実際の応答を縮めたもの）
+const song = (artistId, artistName, trackName) => ({ kind: 'song', artistId, artistName, trackName });
+const natoriResults = [
+    song(10, 'なとり', 'Overdose'), song(10, 'なとり', '金木犀'), song(10, 'なとり', 'セレナーデ'), song(10, 'なとり', 'Sleepwalk'),
+    song(10, 'なとり & imase', 'メロドラマ'),
+    song(11, '名取さな', 'アマカミサマ'), song(11, '名取さな', 'さなのおうた。'),
+    song(12, 'Natori', 'Something'),
+];
+
+test('iTunes のアーティストは、利用者の曲と同じ曲名が多いものを選び、日本語の名前を使う', () => {
+    const pick = pickItunesArtist(natoriResults, { names: ['natori'], titles: ['Overdose'] });
+    assert.equal(pick.id, 10);
+    assert.equal(pick.name, 'なとり'); // 共演の表記ではなく単独の名前
+    assert.ok(pick.ja);
+    assert.ok(pick.keys.has(nameKey('Overdose')));
+    // 曲名が一致しなくても、名前が同じアーティストがあればそれを選ぶ
+    assert.equal(pickItunesArtist(natoriResults, { names: ['Natori'], titles: ['Unknown Song'] }).id, 12);
+    // 名前も曲名も一致しなければ選ばない
+    assert.equal(pickItunesArtist(natoriResults, { names: ['nator1'], titles: ['Unknown Song'] }), null);
+});
+
+test('曲の一覧で 1 曲しか一致しないときは、利用者の曲の半分以上で一致する場合だけ選ぶ', () => {
+    assert.equal(pickItunesArtist(natoriResults, { names: ['x'], titles: ['Overdose', 'A', 'B', 'C'] }), null);
+    assert.equal(pickItunesArtist(natoriResults, { names: ['x'], titles: ['Overdose', 'A'] }).id, 10);
+    assert.equal(pickItunesArtist(natoriResults, { names: ['x'], titles: ['Overdose', 'Sleepwalk', 'A', 'B', 'C'] }).id, 10);
+});
+
+test('日本語の曲名が少ないアーティスト（洋楽）は日本のアーティストとして扱わない', () => {
+    const results = [
+        song(20, 'エド・シーラン', 'Shape of You'), song(20, 'エド・シーラン', 'Perfect'),
+        song(20, 'エド・シーラン', 'Photograph'), song(20, 'エド・シーラン & ジャスティン・ビーバー', 'I Don\'t Care'),
+    ];
+    const pick = pickItunesArtist(results, { names: ['Ed Sheeran'], titles: ['Shape of You', 'Perfect'] });
+    assert.equal(pick.id, 20);
+    assert.ok(!pick.ja);
+});
+
+test('曲の一覧で確かめられないアーティストは、曲の検索結果で確かめる', () => {
+    const groups = itunesArtistGroups([song(30, 'あいみょん', '君はロックを聴かない'), song(31, 'aimyon tribute', 'x')], ['aimyon']);
+    assert.equal(pickItunesArtist([song(30, 'あいみょん', '君はロックを聴かない')], { names: ['aimyon'], titles: ['Marigold'] }), null);
+    const found = [song(99, '別のアーティスト', 'マリーゴールド'), song(30, 'あいみょん', 'マリーゴールド')];
+    assert.equal(findItunesArtistByTrack(found, groups, 'Marigold').id, 30);
+    // 別の版しか見つからなければ確かめられない
+    assert.equal(findItunesArtistByTrack([song(30, 'あいみょん', 'マリーゴールド (Instrumental)')], groups, 'Marigold'), null);
+});
+
+test('古い方式で照合したアーティストは照合し直す', () => {
+    const now = Date.now();
+    assert.ok(needsItunesArtist({ it: { id: 1, name: null, at: now, skip: true } }, now));
+    assert.ok(!needsItunesArtist({ it: { v: ITUNES_VERSION, id: 1, ja: true, name: null, at: now } }, now));
+    assert.ok(!needsItunesArtist({ it: { v: ITUNES_VERSION, id: null, at: now } }, now));
+    assert.ok(needsItunesArtist({ it: { v: ITUNES_VERSION, id: null, at: now - RETRY_MS - 1 } }, now));
+});

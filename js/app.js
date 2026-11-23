@@ -5,7 +5,7 @@ import { icon } from './icons.js';
 import { parseFile } from './parser.js';
 import { emptyDataset, mergeEntries, buildBackup } from './dataset.js';
 import { buildModel, defaultSettings, normalizeSettings, artistKeyOf, resolveAlias, findMergeCandidates } from './model.js';
-import { emptyMeta, normalizeMeta, needsFetch, needsImage, needsItunesArtist, RETRY_MS, JA_RE, ASCII_RE, ytVideos, ytOembed, itunesSearch, itunesArtistSearch, deezerArtistSearch, pickItunes, pickDeezerArtist, runPool, sleep } from './enrich.js';
+import { emptyMeta, normalizeMeta, needsFetch, needsImage, needsItunesArtist, RETRY_MS, ITUNES_VERSION, JA_RE, ASCII_RE, nameKey, songKey, ytVideos, ytOembed, itunesSearch, itunesArtistSongs, deezerArtistSearch, pickItunes, pickItunesArtist, itunesArtistGroups, summarizeItunesArtist, findItunesArtistByTrack, pickDeezerArtist, runPool, sleep } from './enrich.js';
 import { computeStats, computeRanks, computeHighlights, parsePeriod, encodePeriod, periodRange, previousRange, trackDetail, artistDetail, dayDetail } from './stats.js';
 import { getValue, setValues, clearAll, readLegacyEntries } from './store.js';
 import * as V from './views.js';
@@ -507,89 +507,128 @@ async function enrichTitles(stop) {
 }
 
 /**
- * 英字だけの曲名を iTunes（日本のストア）で日本語表記にする。
- * アーティストごとに iTunes のアーティストを探し、曲の検索結果が同じアーティスト ID のときだけ採用する。
- * 最初の数曲で表記が変わらないアーティスト（洋楽など）は、それ以上問い合わせない。
+ * iTunes（日本のストア）で、英語やローマ字の曲名・アーティスト名を日本語の表記にする。
+ * 1. アーティストごとに、iTunes でそのアーティストの曲の一覧を取得し、利用者の曲名と照らしてアーティストを特定する。
+ *    日本語の曲名が多いアーティストなら、iTunes での名前（日本語）をアーティスト名に使う。
+ * 2. 日本のアーティストの曲のうち、一覧にない英字だけの曲名（英訳・ローマ字）を 1 曲ずつ探し、
+ *    同じアーティスト ID の曲が見つかったときだけ採用する。洋楽など日本語の曲名がないアーティストは問い合わせない。
  */
 async function enrichItunes(stop) {
     refreshFromMeta(true);
     const model = state.model;
     const meta = state.extMeta;
-    const PROBE = 3;
     const WAIT = 3100; // iTunes の回数制限（1 分あたり約 20 回）に合わせる
+    const started = Date.now();
+    const checked = (m) => m && m.it !== undefined && started - (m.itAt || 0) < RETRY_MS;
 
-    // アーティストごとに、英字だけでまだ確認していない曲を集める
+    // アーティストごとに、照合に使う曲名と、英字だけでまだ確認していない曲を集める
     const byArtist = new Map();
     model.tracks.forEach((t, ti) => {
-        if (!t.v || !model.trackTotal[ti] || !ASCII_RE.test(t.title) || t.title === 'タイトル不明') return;
-        const m = meta.tracks[t.v];
-        if (m && m.it !== undefined && Date.now() - (m.itAt || 0) < RETRY_MS) return;
-        let list = byArtist.get(t.artistIdx);
-        if (!list) byArtist.set(t.artistIdx, (list = []));
-        list.push(ti);
+        if (!model.trackTotal[ti]) return;
+        let x = byArtist.get(t.artistIdx);
+        if (!x) byArtist.set(t.artistIdx, (x = { titles: [], todo: [], plays: 0 }));
+        x.titles.push(t.title, ...t.variants);
+        x.plays += model.trackTotal[ti];
+        if (t.v && t.title !== 'タイトル不明' && ASCII_RE.test(t.title) && !checked(meta.tracks[t.v])) x.todo.push(ti);
     });
-    const artists = [...byArtist.entries()]
-        .map(([ai, list]) => ({ a: model.artists[ai], list: list.sort((x, y) => model.trackTotal[y] - model.trackTotal[x]) }))
-        .filter(({ a }) => a.key !== 'a:?' && !(meta.artists[a.key]?.it?.skip && Date.now() - meta.artists[a.key].it.at < RETRY_MS))
-        .sort((x, y) => y.list.reduce((n, ti) => n + model.trackTotal[ti], 0) - x.list.reduce((n, ti) => n + model.trackTotal[ti], 0));
-    if (!artists.length) return;
+    const items = [];
+    for (const [ai, x] of byArtist) {
+        const a = model.artists[ai];
+        if (a.key === 'a:?') continue;
+        const it = meta.artists[a.key]?.it;
+        const needArtist = needsItunesArtist(meta.artists[a.key], started);
+        // アーティストの照合が要るのは、英字だけの曲名があるか、名前が英字だけのとき
+        if (needArtist ? !(x.todo.length || !JA_RE.test(a.name)) : !(it.id && it.ja && x.todo.length)) continue;
+        x.todo.sort((p, q) => model.trackTotal[q] - model.trackTotal[p]);
+        items.push({ a, x, needArtist });
+    }
+    if (!items.length) return;
+    items.sort((p, q) => q.x.plays - p.x.plays);
 
-    state.enrich = { label: '日本語の曲名', done: 0, total: artists.reduce((n, x) => n + x.list.length, 0) };
+    state.enrich = { label: '日本語の表記', done: 0, total: items.reduce((n, { x, needArtist }) => n + x.todo.length + (needArtist ? 1 : 0), 0) };
     setEnrichStatus();
     let sinceRefresh = 0;
+    const progress = (k = 1) => {
+        state.enrich.done += k;
+        setEnrichStatus();
+        sinceRefresh += k;
+        if (sinceRefresh >= 10) { sinceRefresh = 0; saveMeta(); refreshFromMeta(); }
+    };
+    // 回数制限に達したら 1 分待って 2 回まで再試行する
     const ask = async (fn) => {
-        const r = await fn();
-        await sleep(WAIT);
-        return r;
+        for (let attempt = 0; ; attempt++) {
+            try {
+                const r = await fn();
+                await sleep(WAIT);
+                return r;
+            } catch (err) {
+                if (!err.rate || attempt >= 2) throw err;
+                for (let s = 0; s < 60 && !stop(); s++) await sleep(1000);
+                if (stop()) throw err;
+            }
+        }
+    };
+    let failures = 0;
+    const failed = async (err) => {
+        // 一時的な失敗は記録せず、次に開いたときにもう一度問い合わせる。続くようなら打ち切る
+        if (err.rate || ++failures >= 3) throw err;
+        await sleep(WAIT * 5);
     };
 
     try {
-        for (const { a, list } of artists) {
+        for (const { a, x, needArtist } of items) {
             if (stop()) break;
             const entry = meta.artists[a.key] || (meta.artists[a.key] = {});
-            // 1. アーティストを探す
-            if (needsItunesArtist(entry)) {
-                const found = await ask(() => itunesArtistSearch(a.name));
-                const top = found[0];
-                entry.it = top ? { id: top.artistId, cand: top.artistName, name: null, at: Date.now() } : { id: null, name: null, at: Date.now() };
+            let keys = null;
+            const searched = new Map(); // 曲 → 曲名での検索結果（アーティストの確認に使ったもの）
+            // 1. アーティストを特定する
+            if (needArtist) {
+                const names = [a.name, ...a.aliasNames];
+                let pick;
+                try {
+                    const results = await ask(() => itunesArtistSongs(a.name));
+                    pick = pickItunesArtist(results, { names, titles: x.titles });
+                    // 曲の一覧で確かめられない（手元の曲名がすべて英訳やローマ字など）ときは、曲を検索して確かめる
+                    const groups = pick ? null : itunesArtistGroups(results, names);
+                    for (const ti of groups && groups.size ? x.todo.slice(0, 2) : []) {
+                        const found = await ask(() => itunesSearch(`${model.tracks[ti].title} ${a.name}`));
+                        searched.set(ti, found);
+                        const g = findItunesArtistByTrack(found, groups, model.tracks[ti].title);
+                        if (g) { pick = summarizeItunesArtist(g); break; }
+                    }
+                } catch (err) { await failed(err); progress(1 + x.todo.length); continue; }
+                failures = 0;
+                entry.it = pick
+                    ? { v: ITUNES_VERSION, id: pick.id, ja: pick.ja, name: pick.ja && JA_RE.test(pick.name) ? pick.name : null, at: Date.now() }
+                    : { v: ITUNES_VERSION, id: null, ja: false, name: null, at: Date.now() };
+                keys = pick ? pick.keys : null;
+                progress();
             }
-            if (!entry.it.id) {
-                state.enrich.done += list.length;
-                setEnrichStatus();
-                continue;
-            }
-            // 2. 曲ごとに探し、同じアーティスト ID の曲だけを採用する
-            let tried = 0, changed = 0;
-            for (const ti of list) {
+            const it = entry.it;
+            if (!it.id || !it.ja) { progress(x.todo.length); continue; }
+            // 2. 一覧にない英字だけの曲名を 1 曲ずつ探す
+            for (const ti of x.todo) {
                 if (stop()) break;
                 const t = model.tracks[ti];
-                const results = await ask(() => itunesSearch(`${t.title} ${a.name}`));
-                const pick = pickItunes(results, { title: t.title, artistId: entry.it.id });
                 const m = meta.tracks[t.v] || (meta.tracks[t.v] = {});
-                m.it = pick ? pick.title : '';
+                if (keys && (keys.has(nameKey(t.title)) || keys.has(songKey(t.title)))) {
+                    m.it = ''; // 一覧に同じ表記の曲がある
+                } else {
+                    let results = searched.get(ti);
+                    if (!results) {
+                        try { results = await ask(() => itunesSearch(`${t.title} ${a.name}`)); } catch (err) { await failed(err); progress(); continue; }
+                        failures = 0;
+                    }
+                    const pick = pickItunes(results, { title: t.title, artistId: it.id });
+                    m.it = pick ? pick.title : '';
+                }
                 m.itAt = Date.now();
-                if (pick) {
-                    changed++;
-                    // 曲が一致したので、アーティストの日本語の名前も確かめられた
-                    if (JA_RE.test(pick.artist || '')) entry.it.name = pick.artist;
-                    else if (JA_RE.test(entry.it.cand || '')) entry.it.name = entry.it.cand;
-                }
-                tried++;
-                state.enrich.done++;
-                setEnrichStatus();
-                if (++sinceRefresh >= 10) { sinceRefresh = 0; saveMeta(); refreshFromMeta(); }
-                if (tried >= PROBE && !changed) {
-                    // 表記が変わらないアーティスト。残りは問い合わせない
-                    entry.it.skip = true;
-                    state.enrich.done += list.length - tried;
-                    setEnrichStatus();
-                    break;
-                }
+                progress();
             }
         }
     } catch (err) {
-        if (!err.rate) throw err;
-        // 回数制限に達した。続きは次に開いたときに行う
+        if (!err.rate && !err.temp) throw err;
+        // 回数制限や通信の失敗が続いた。続きは次に開いたときに行う
     }
     saveMeta();
     refreshFromMeta();
