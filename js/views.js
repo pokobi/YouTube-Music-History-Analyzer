@@ -5,7 +5,7 @@ import { icon } from './icons.js';
 import { barChart, calendarHeatmap, weekHourHeatmap, donutChart, monthItems, dayItems } from './charts.js';
 import { previousLabel, monthOfDay, rankByTime } from './stats.js';
 import { resolveAlias, findMergeCandidates } from './model.js';
-import { artistImageOf, wikidataImageOf } from './enrich.js';
+import { artistImageOf, spotifyImageOf } from './enrich.js';
 
 export const TABS = [
     ['overview', '概要'],
@@ -34,26 +34,19 @@ function initial(name) {
 }
 
 /**
- * 表示するアーティストの画像（チャンネルのアイコン → Wikidata の写真 → Deezer の写真 → いちばん聴いた曲のジャケット）。
- * Wikidata の写真なら credit に作者とライセンスを入れる。画像がなければ null
+ * 表示するアーティストの画像（チャンネルのアイコン → Spotify の画像 → Deezer の写真 → いちばん聴いた曲のジャケット）。
+ * Spotify の画像なら spotify にアーティスト ID を入れる。画像がなければ null
  */
 export function artistPicture(state, a) {
     if (!state.settings.showThumbnails) return null;
     const ch = a.channelId ? state.channelImages[a.channelId] : null;
     if (ch) return { src: ch };
     const entry = state.settings.fetchMeta ? state.extMeta.artists[a.key] : null;
-    const wd = wikidataImageOf(entry);
-    if (wd) return { src: wd.img, credit: wd };
+    const sp = spotifyImageOf(entry);
+    if (sp) return { src: sp.img, spotify: sp.id };
     const dz = artistImageOf(entry);
     if (dz) return { src: dz };
     return a.imageV ? { src: `https://i.ytimg.com/vi/${a.imageV}/mqdefault.jpg` } : null;
-}
-
-/** 写真のクレジット（作者 / ライセンス） */
-function photoCredit(c) {
-    const author = c.page ? html`<a href="${c.page}" target="_blank" rel="noopener noreferrer">${c.author}</a>` : c.author;
-    const license = c.license ? (c.licenseUrl ? html` / <a href="${c.licenseUrl}" target="_blank" rel="noopener noreferrer">${c.license}</a>` : html` / ${c.license}`) : '';
-    return html`${author}${license}`;
 }
 
 /** アーティストの画像。なければ頭文字 */
@@ -563,10 +556,8 @@ export function dataView(state) {
     for (const v of Object.values(state.extMeta.tracks)) { if (v.t) metaStats.titles++; else metaStats.failed++; }
     for (const v of Object.values(state.extMeta.artists)) {
         const img = artistImageOf(v);
-        if (img || wikidataImageOf(v)) metaStats.images++; else if (img === '') metaStats.failed++;
+        if (img || spotifyImageOf(v)) metaStats.images++; else if (img === '') metaStats.failed++;
     }
-    // Wikidata の写真を使っているアーティスト（クレジットの一覧）
-    const credits = model.artists.map((a) => ({ a, pic: artistPicture(state, a) })).filter((x) => x.pic && x.pic.credit);
     const fetched = Object.values(state.channelImages).filter(Boolean).length;
 
     return html`
@@ -622,16 +613,10 @@ export function dataView(state) {
             <p class="note">英語やローマ字で書き出された曲名を、YouTube に登録されている元の表記（原題）に置き換えます。書き出されたときの表記は「別の表記」として残り、検索にも使えます。</p>
             <ul class="notes">
                 <li>曲名とアーティスト名: YouTube（動画 ID を送信）。YouTube でも英語やローマ字で登録されているものは、iTunes Search API（アーティスト名と曲名を送信）で日本語の表記を探します。iTunes の曲の一覧と照らしてアーティストが一致し、日本語の曲名が多いアーティストの場合だけ使います。</li>
-                <li>アーティスト画像: Deezer（アーティスト名と、よく聴いた曲の曲名を送信）。よく聴いた曲で本人の曲を確かめられた場合だけ使い、確かめられなければ曲のジャケットを表示します。</li>
-                <li>アーティスト写真: Wikidata・Wikimedia Commons（照合済みの Apple・Deezer のアーティスト ID を送信）。登録されている写真があれば Deezer の写真より優先して使います。写真の作者とライセンスは、アーティストの詳細画面と下の一覧に表示します。</li>
+                <li>アーティスト画像: Spotify に設定されている画像を優先して使います。照合済みの Apple・Deezer のアーティスト ID から Wikidata で Spotify のアーティスト ID を調べ、Spotify にその ID を送って画像を取得します。</li>
+                <li>Spotify の画像がないときは Deezer（アーティスト名と、よく聴いた曲の曲名を送信）の写真を使います。よく聴いた曲で本人の曲を確かめられた場合だけ使い、確かめられなければ曲のジャケットを表示します。</li>
                 <li>オフにすると問い合わせを止め、書き出されたときの表記で表示します。</li>
             </ul>
-            ${credits.length ? html`
-                <details class="howto howto--plain">
-                    <summary>写真のクレジット（${formatNumber(credits.length)}件）</summary>
-                    <ul class="credits">${credits.map(({ a, pic }) => html`<li><span class="credits__name">${a.name}</span> 写真: ${photoCredit(pic.credit)}</li>`)}</ul>
-                    <p class="credits__note">写真は Wikimedia Commons のもので、それぞれのライセンスに従って表示しています。</p>
-                </details>` : ''}
         `)}
 
         ${card('チャンネルのアイコン（YouTube Data API）', html`
@@ -825,16 +810,12 @@ export function artistDetailView(state, ai, d, rank, total) {
                 <p class="detail__kind">アーティスト</p>
                 <h2 class="detail__title">${a.name}</h2>
                 ${a.aliasNames.length ? html`<p class="detail__aka">別名: ${a.aliasNames.join('、')}</p>` : ''}
+                ${pic && pic.spotify ? html`<p class="detail__credit">画像: <a href="https://open.spotify.com/artist/${pic.spotify}" target="_blank" rel="noopener noreferrer">Spotify</a></p>` : ''}
             </div>
             <button type="button" class="icon-btn" data-action="close-detail" aria-label="閉じる" autofocus>${icon('x')}</button>
         </header>
         <div class="detail__body">
             ${excluded ? html`<p class="banner">${icon('eyeOff')} このアーティストは集計から除外されています。</p>` : ''}
-            ${pic && pic.credit ? html`
-                <figure class="detail__photo">
-                    <img src="${pic.src}" alt="${a.name} の写真" loading="lazy" decoding="async" referrerpolicy="no-referrer">
-                    <figcaption>写真: ${photoCredit(pic.credit)}（Wikimedia Commons）</figcaption>
-                </figure>` : ''}
             <p class="detail__period">${state.periodLabel}</p>
             <div class="tiles tiles--small">
                 ${tile('再生回数', `${formatNumber(d.count)}回`, total && !excluded ? formatPercent(d.count / total) : '')}

@@ -5,8 +5,7 @@
 //   tracks:  { [動画ID]: { t: YouTube の曲名|null, a: チャンネル名|null, src: 'yt'|'none', at,
 //                          it: iTunes の日本語の曲名|''（変わらない）, itAt } },
 //   artists: { [アーティストキー]: { img: Deezer の画像URL|''（確かめられない・写真なし）, imgAt, imgV: IMAGE_VERSION, dzId: Deezer のアーティストID,
-//                                    wd: { v: WIKIDATA_VERSION, key: 照合に使った ID, img: Wikimedia Commons の写真の縮小版URL|'',
-//                                          page: 写真のページ, author, license, licenseUrl, at },
+//                                    sp: { v: SPOTIFY_VERSION, key: 照合に使った ID, id: Spotify のアーティストID|'', img: Spotify の画像URL|'', at },
 //                                    it: { v: ITUNES_VERSION, id: iTunes のアーティストID|null,
 //                                          ja: 日本語の曲名が多いアーティストか, name: 日本語の名前|null, at } } },
 // }
@@ -229,91 +228,75 @@ export function pickDeezerByTracks(searches, names) {
     return { confirmed: false, img: '', id: null };
 }
 
-// --- Wikidata（Wikimedia Commons の写真） ---
+// --- Spotify の画像（Wikidata で Spotify のアーティスト ID を調べる） ---
 
-// Wikidata の写真の取得方法の版
-export const WIKIDATA_VERSION = 1;
+// Spotify の画像の取得方法の版
+export const SPOTIFY_VERSION = 1;
 
-/** Wikidata で照合に使うキー（照合済みの Apple と Deezer のアーティスト ID）。どちらもなければ '' */
-export function wikidataKeyOf(entry) {
+const SPOTIFY_ID_RE = /^[0-9A-Za-z]{22}$/;
+
+/** Spotify の ID を調べるのに使うキー（照合済みの Apple と Deezer のアーティスト ID）。どちらもなければ '' */
+export function spotifyKeyOf(entry) {
     const apple = entry && entry.it && entry.it.v === ITUNES_VERSION && entry.it.id ? String(entry.it.id) : '';
     const deezer = entry && entry.imgV === IMAGE_VERSION && entry.dzId ? String(entry.dzId) : '';
     return apple || deezer ? `${apple}/${deezer}` : '';
 }
 
-/** Wikidata の写真をまだ調べていないか（ID が変わった、または 30 日たった） */
-export function needsWikidata(entry, now = Date.now()) {
-    const key = wikidataKeyOf(entry);
+/** Spotify の画像をまだ調べていないか（照合した ID が変わった、または 30 日たった） */
+export function needsSpotify(entry, now = Date.now()) {
+    const key = spotifyKeyOf(entry);
     if (!key) return false;
-    const wd = entry.wd;
-    return !wd || wd.v !== WIKIDATA_VERSION || wd.key !== key || now - (wd.at || 0) > RETRY_MS;
+    const sp = entry.sp;
+    return !sp || sp.v !== SPOTIFY_VERSION || sp.key !== key || now - (sp.at || 0) > RETRY_MS;
 }
 
-/** 表示に使う Wikidata の写真（{img, page, author, license, licenseUrl}）。なければ null */
-export function wikidataImageOf(entry) {
-    const wd = entry && entry.wd;
-    return wd && wd.v === WIKIDATA_VERSION && wd.img && wd.key === wikidataKeyOf(entry) ? wd : null;
+/** 表示に使う Spotify の画像（{img, id}）。なければ null */
+export function spotifyImageOf(entry) {
+    const sp = entry && entry.sp;
+    return sp && sp.v === SPOTIFY_VERSION && sp.img && sp.id && sp.key === spotifyKeyOf(entry) ? sp : null;
 }
 
-/** Apple（P2850）と Deezer（P2722）のアーティスト ID から、写真（P18）をまとめて引く SPARQL */
-export function wikidataQuery(appleIds, deezerIds) {
+/** Apple（P2850）と Deezer（P2722）のアーティスト ID から、Spotify のアーティスト ID（P1902）をまとめて引く SPARQL */
+export function spotifyIdQuery(appleIds, deezerIds) {
     const vals = (xs) => xs.map(String).filter((x) => /^\d+$/.test(x)).map((x) => `"${x}"`).join(' ');
     const parts = [];
     if (vals(appleIds)) parts.push(`{ VALUES ?apple { ${vals(appleIds)} } ?item wdt:P2850 ?apple . }`);
     if (vals(deezerIds)) parts.push(`{ VALUES ?deezer { ${vals(deezerIds)} } ?item wdt:P2722 ?deezer . }`);
-    return parts.length ? `SELECT ?apple ?deezer ?image WHERE { ${parts.join(' UNION ')} ?item wdt:P18 ?image . }` : '';
+    return parts.length ? `SELECT ?apple ?deezer ?spotify WHERE { ${parts.join(' UNION ')} ?item wdt:P1902 ?spotify . }` : '';
 }
 
-/** SPARQL の結果を、ID ごとの Commons のファイル名にする */
-export function parseWikidataImages(json) {
+/** SPARQL の結果を、Apple・Deezer の ID ごとの Spotify の ID の一覧にする */
+export function parseSpotifyIds(json) {
     const apple = new Map();
     const deezer = new Map();
+    const add = (m, k, id) => {
+        const xs = m.get(k) || [];
+        if (!xs.includes(id)) xs.push(id);
+        m.set(k, xs);
+    };
     for (const b of json?.results?.bindings || []) {
-        const file = commonsFileName(b.image?.value);
-        if (!file) continue;
-        if (b.apple && !apple.has(b.apple.value)) apple.set(b.apple.value, file);
-        if (b.deezer && !deezer.has(b.deezer.value)) deezer.set(b.deezer.value, file);
+        const id = b.spotify?.value;
+        if (!SPOTIFY_ID_RE.test(id || '')) continue;
+        if (b.apple) add(apple, b.apple.value, id);
+        if (b.deezer) add(deezer, b.deezer.value, id);
     }
     return { apple, deezer };
 }
 
-/** Special:FilePath の URL からファイル名を取り出し、Commons の表記（空白区切り）にそろえる */
-export function commonsFileName(url) {
-    if (!url) return '';
-    let name = String(url).split('/').pop();
-    try { name = decodeURIComponent(name); } catch { /* そのまま使う */ }
-    name = name.replace(/_/g, ' ').trim();
-    return name ? name[0].toUpperCase() + name.slice(1) : '';
+/** Spotify の oEmbed の結果から、アーティスト名と画像を取り出す（Spotify の画像サーバーの https の URL だけ使う） */
+export function parseSpotifyOembed(json) {
+    const img = json && typeof json.thumbnail_url === 'string' ? json.thumbnail_url : '';
+    return {
+        title: json && typeof json.title === 'string' ? json.title : '',
+        img: /^https:\/\/[a-z0-9.-]+\.(spotifycdn\.com|scdn\.co)\//i.test(img) ? img : '',
+    };
 }
 
-/** HTML（作者名などに含まれるリンク）を文字だけにする */
-export function stripHtml(s) {
-    const text = String(s || '')
-        .replace(/<[^>]*>/g, ' ')
-        .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
-        .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
-        .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
-        .replace(/\s+/g, ' ')
-        .trim();
-    return text.length > 80 ? `${text.slice(0, 79)}…` : text;
-}
-
-/** Commons の imageinfo の結果を、ファイル名ごとの写真の情報にする */
-export function parseCommonsInfo(json) {
-    const out = new Map();
-    for (const p of Object.values(json?.query?.pages || {})) {
-        const ii = p && p.imageinfo && p.imageinfo[0];
-        if (!ii || !/^https:\/\//.test(ii.thumburl || '')) continue;
-        const m = ii.extmetadata || {};
-        out.set(commonsFileName(String(p.title).replace(/^File:/, '')), {
-            img: ii.thumburl,
-            page: /^https?:\/\//.test(ii.descriptionurl || '') ? ii.descriptionurl : '',
-            author: stripHtml(m.Artist?.value) || '不明',
-            license: stripHtml(m.LicenseShortName?.value),
-            licenseUrl: /^https?:\/\//.test(m.LicenseUrl?.value || '') ? m.LicenseUrl.value : '',
-        });
-    }
-    return out;
+/** Spotify の ID が複数あるときは、名前が一致するものを選ぶ。なければ画像のある最初のもの */
+export function pickSpotify(results, names) {
+    const keys = new Set(names.filter(Boolean).map(nameKey));
+    const ok = results.filter((r) => r && r.img);
+    return ok.find((r) => keys.has(nameKey(r.title))) || ok[0] || null;
 }
 
 /** 検索に使う表記を選ぶ（Deezer は英語・ローマ字の表記でよく見つかるため、英字だけの表記を優先する） */
@@ -382,9 +365,9 @@ export function itunesArtistSongs(name) {
     return itunesQuery({ term: name, entity: 'song', attribute: 'artistTerm', limit: '200' });
 }
 
-/** Wikidata の SPARQL で写真のファイル名を引く */
-export async function wikidataImages(appleIds, deezerIds) {
-    const query = wikidataQuery(appleIds, deezerIds);
+/** Wikidata の SPARQL で、Spotify のアーティスト ID を引く */
+export async function wikidataSpotifyIds(appleIds, deezerIds) {
+    const query = spotifyIdQuery(appleIds, deezerIds);
     if (!query) return { apple: new Map(), deezer: new Map() };
     let res;
     try {
@@ -398,24 +381,23 @@ export async function wikidataImages(appleIds, deezerIds) {
     }
     if (res.status === 429) throw Object.assign(new Error('rate'), { rate: true });
     if (!res.ok) throw Object.assign(new Error(`wikidata ${res.status}`), { temp: true });
-    return parseWikidataImages(await res.json());
+    return parseSpotifyIds(await res.json());
 }
 
-/** Wikimedia Commons から、写真の縮小版・作者・ライセンスを 50 件まで取得する */
-export async function commonsInfo(files) {
-    const url = `https://commons.wikimedia.org/w/api.php?${new URLSearchParams({
-        action: 'query', titles: files.map((f) => `File:${f}`).join('|'), prop: 'imageinfo', iiprop: 'url|extmetadata', iiurlwidth: '500',
-        iiextmetadatafilter: 'Artist|LicenseShortName|LicenseUrl', format: 'json', origin: '*',
-    })}`;
+/** Spotify の oEmbed で、アーティストの名前と画像を取得する。アーティストが見つからなければ null */
+export async function spotifyArtistImage(id) {
+    if (!SPOTIFY_ID_RE.test(id || '')) return null;
+    const url = `https://open.spotify.com/oembed?url=${encodeURIComponent(`https://open.spotify.com/artist/${id}`)}`;
     let res;
     try {
         res = await fetch(url);
     } catch {
         throw Object.assign(new Error('network'), { temp: true });
     }
+    if (res.status === 404 || res.status === 400) return null;
     if (res.status === 429) throw Object.assign(new Error('rate'), { rate: true });
-    if (!res.ok) throw Object.assign(new Error(`commons ${res.status}`), { temp: true });
-    return parseCommonsInfo(await res.json());
+    if (!res.ok) throw Object.assign(new Error(`spotify ${res.status}`), { temp: true });
+    return { id, ...parseSpotifyOembed(await res.json()) };
 }
 
 let jsonpSeq = 0;
