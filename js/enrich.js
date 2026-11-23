@@ -40,13 +40,24 @@ export const IMAGE_VERSION = 2;
 
 /** 今の方式で取得したアーティスト画像（なければ null）。'' は「確かめられなかった」 */
 export function artistImageOf(entry) {
-    return entry && entry.imgV === IMAGE_VERSION ? entry.img : null;
+    if (!entry || entry.imgV !== IMAGE_VERSION) return null;
+    return isDeezerPlaceholder(entry.img) ? '' : entry.img;
+}
+
+// Deezer の「写真なし」の仮の画像（画像のハッシュが空、または空文字列の MD5）
+const DEEZER_PLACEHOLDER_RE = /\/images\/artist\/(d41d8cd98f00b204e9800998ecf8427e)?\//;
+
+/** Deezer の「写真なし」の仮の画像か */
+export function isDeezerPlaceholder(url) {
+    return DEEZER_PLACEHOLDER_RE.test(url || '');
 }
 
 /** アーティスト画像をまだ取得していないか */
 export function needsImage(entry, now = Date.now()) {
     if (!entry || entry.imgV !== IMAGE_VERSION || entry.img === undefined) return true;
     if (entry.img && !entry.dzId) return true;
+    // 以前の版で、写真なしの仮の画像を写真として記録したもの
+    if (isDeezerPlaceholder(entry.img)) return true;
     if (entry.img === '') {
         if (now - (entry.imgAt || 0) > RETRY_MS) return true;
         // iTunes で日本語の名前や曲名が分かったのが画像を探したあとなら、もう一度探す
@@ -194,7 +205,7 @@ export function deezerTrackCandidates(results, { titles = [], names = [] }) {
         const a = r && r.artist;
         if (!a || !a.id || !r.title || COPY_RE.test(r.title)) continue;
         const c = out.get(a.id) || { id: a.id, picture: '', titleMatch: false, nameMatch: false };
-        if (!c.picture && a.picture_medium && !/\/images\/artist\/\//.test(a.picture_medium)) c.picture = a.picture_medium;
+        if (!c.picture && a.picture_medium && !isDeezerPlaceholder(a.picture_medium)) c.picture = a.picture_medium;
         if (titleKeys.has(nameKey(r.title))) c.titleMatch = true;
         if (nameKeys.has(nameKey(a.name))) c.nameMatch = true;
         out.set(a.id, c);
@@ -234,6 +245,9 @@ export function pickDeezerByTracks(searches, names) {
 export const SPOTIFY_VERSION = 1;
 
 const SPOTIFY_ID_RE = /^[0-9A-Za-z]{22}$/;
+// Spotify の画像サーバーにある、アーティスト自身の画像（ab6761610000…）。
+// アーティストの画像がないと、oEmbed はアルバムのジャケット（ab67616d…）を返すため、それは使わない
+const SPOTIFY_IMG_RE = /^https:\/\/[a-z0-9.-]+\.(spotifycdn\.com|scdn\.co)\/image\/ab6761610000[0-9a-f]+$/i;
 
 /** Spotify の ID を調べるのに使うキー（照合済みの Apple と Deezer のアーティスト ID）。どちらもなければ '' */
 export function spotifyKeyOf(entry) {
@@ -253,7 +267,7 @@ export function needsSpotify(entry, now = Date.now()) {
 /** 表示に使う Spotify の画像（{img, id}）。なければ null */
 export function spotifyImageOf(entry) {
     const sp = entry && entry.sp;
-    return sp && sp.v === SPOTIFY_VERSION && sp.img && sp.id && sp.key === spotifyKeyOf(entry) ? sp : null;
+    return sp && sp.v === SPOTIFY_VERSION && SPOTIFY_IMG_RE.test(sp.img || '') && sp.id && sp.key === spotifyKeyOf(entry) ? sp : null;
 }
 
 /** Apple（P2850）と Deezer（P2722）のアーティスト ID から、Spotify のアーティスト ID（P1902）をまとめて引く SPARQL */
@@ -283,12 +297,12 @@ export function parseSpotifyIds(json) {
     return { apple, deezer };
 }
 
-/** Spotify の oEmbed の結果から、アーティスト名と画像を取り出す（Spotify の画像サーバーの https の URL だけ使う） */
+/** Spotify の oEmbed の結果から、アーティスト名と画像を取り出す（Spotify の画像サーバーにあるアーティスト自身の画像だけ使う） */
 export function parseSpotifyOembed(json) {
     const img = json && typeof json.thumbnail_url === 'string' ? json.thumbnail_url : '';
     return {
         title: json && typeof json.title === 'string' ? json.title : '',
-        img: /^https:\/\/[a-z0-9.-]+\.(spotifycdn\.com|scdn\.co)\//i.test(img) ? img : '',
+        img: SPOTIFY_IMG_RE.test(img) ? img : '',
     };
 }
 

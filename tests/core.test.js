@@ -287,6 +287,15 @@ test('Deezer で名前の表記が違うアーティストは、2 曲で同じ�
 test('Deezer で本人を確かめられても写真がなければ空にする', () => {
     const results = [dz('Song', 30, 'Minor Artist', 'https://cdn/images/artist//250x250.jpg')];
     assert.deepEqual(pickDeezerByTracks([{ results, titles: ['Song'] }], ['Minor Artist']), { confirmed: true, img: '', id: 30 });
+    // 画像のハッシュが空文字列の MD5 のものも、写真なしの仮の画像
+    const blank = 'https://cdn-images.dzcdn.net/images/artist/d41d8cd98f00b204e9800998ecf8427e/250x250-000000-80-0-0.jpg';
+    const kai = [dz('マジカホリック', 106837152, 'カイ', blank)];
+    assert.deepEqual(pickDeezerByTracks([{ results: kai, titles: ['マジカホリック'] }], ['Kai', 'カイ']), { confirmed: true, img: '', id: 106837152 });
+    // 以前の版で記録した仮の画像は使わず、取り直す
+    const now = Date.now();
+    const stored = { img: blank, imgAt: now, imgV: IMAGE_VERSION, dzId: 106837152 };
+    assert.equal(artistImageOf(stored), '');
+    assert.ok(needsImage(stored, now));
 });
 
 test('検索には英字だけの表記を優先して使う', () => {
@@ -464,7 +473,7 @@ test('Spotify の ID を調べるキーは、照合済みの Apple と Deezer �
     const entry = { it: { v: ITUNES_VERSION, id: 1 }, imgV: IMAGE_VERSION, dzId: 2 };
     assert.ok(needsSpotify(entry, now));
     assert.ok(!needsSpotify({}, now));
-    const sp = { v: SPOTIFY_VERSION, key: '1/2', id: SP_MGA, img: 'https://image-cdn-ak.spotifycdn.com/image/x', at: now };
+    const sp = { v: SPOTIFY_VERSION, key: '1/2', id: SP_MGA, img: 'https://image-cdn-ak.spotifycdn.com/image/ab67616100005174c0a723402eb1cfbf2e10ce5c', at: now };
     assert.ok(!needsSpotify({ ...entry, sp }, now));
     // ID が変わったら調べ直し、画像は使わない
     const moved = { ...entry, dzId: 3, sp };
@@ -476,6 +485,8 @@ test('Spotify の ID を調べるキーは、照合済みの Apple と Deezer �
 
     assert.equal(spotifyImageOf({ ...entry, sp }), sp);
     assert.equal(spotifyImageOf({ ...entry, sp: { ...sp, img: '' } }), null);
+    // アルバムのジャケットは使わない（以前の版で記録したもの）
+    assert.equal(spotifyImageOf({ ...entry, sp: { ...sp, img: 'https://image-cdn-ak.spotifycdn.com/image/ab67616d00001e022d92e9a2bbb598b699513481' } }), null);
     assert.equal(spotifyImageOf(undefined), null);
 });
 
@@ -507,12 +518,14 @@ test('Wikidata の結果を、ID ごとの Spotify の ID の一覧にする', (
     assert.equal(parseSpotifyIds({}).apple.size, 0);
 });
 
-test('Spotify の画像は、Spotify の画像サーバーの https の URL だけ使う', () => {
-    assert.deepEqual(parseSpotifyOembed({ title: 'Mrs. GREEN APPLE', thumbnail_url: 'https://image-cdn-ak.spotifycdn.com/image/ab67' }),
-        { title: 'Mrs. GREEN APPLE', img: 'https://image-cdn-ak.spotifycdn.com/image/ab67' });
-    assert.equal(parseSpotifyOembed({ thumbnail_url: 'https://i.scdn.co/image/ab67' }).img, 'https://i.scdn.co/image/ab67');
-    assert.equal(parseSpotifyOembed({ thumbnail_url: 'http://i.scdn.co/image/ab67' }).img, '');
-    assert.equal(parseSpotifyOembed({ thumbnail_url: 'https://evil.example/scdn.co/x' }).img, '');
+test('Spotify の画像は、Spotify の画像サーバーにあるアーティスト自身の画像だけ使う', () => {
+    assert.deepEqual(parseSpotifyOembed({ title: 'Mrs. GREEN APPLE', thumbnail_url: 'https://image-cdn-ak.spotifycdn.com/image/ab67616100005174c0a723402eb1cfbf2e10ce5c' }), { title: 'Mrs. GREEN APPLE', img: 'https://image-cdn-ak.spotifycdn.com/image/ab67616100005174c0a723402eb1cfbf2e10ce5c' });
+    assert.equal(parseSpotifyOembed({ thumbnail_url: 'https://i.scdn.co/image/ab6761610000e5eb0b6fd24c' }).img, 'https://i.scdn.co/image/ab6761610000e5eb0b6fd24c');
+    // アーティストの画像がないときに返るアルバムのジャケット
+    assert.equal(parseSpotifyOembed({ thumbnail_url: 'https://image-cdn-ak.spotifycdn.com/image/ab67616d00001e022d92e9a2bbb598b699513481' }).img, '');
+    assert.equal(parseSpotifyOembed({ title: 'No Image' }).img, '');
+    assert.equal(parseSpotifyOembed({ thumbnail_url: 'http://i.scdn.co/image/ab6761610000e5eb0b6fd24c' }).img, '');
+    assert.equal(parseSpotifyOembed({ thumbnail_url: 'https://evil.example/scdn.co/image/ab6761610000e5eb' }).img, '');
     assert.equal(parseSpotifyOembed({ thumbnail_url: 'javascript:alert(1)' }).img, '');
     assert.deepEqual(parseSpotifyOembed(null), { title: '', img: '' });
 });
