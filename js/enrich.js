@@ -120,31 +120,31 @@ export function itunesArtistGroups(results, names = []) {
 }
 
 /**
- * まとめたアーティストの情報。name は iTunes での名前（共演の表記を避けていちばん多いもの）、
+ * まとめたアーティストの情報。name は iTunes での単独の名前（いちばん多いもの。共演の表記「A & B」などしかなければ null）、
  * ja は日本語の曲名が多いか、keys は曲名の照合用キーの一覧
  * @returns {{id, name, ja: boolean, keys: Set<string>}}
  */
 export function summarizeItunesArtist(g) {
     const byCount = [...g.names.entries()].sort((x, y) => y[1] - x[1]);
-    const solo = byCount.find(([n]) => !MULTI_ARTIST_RE.test(n)) || byCount[0];
-    return { id: g.id, name: solo[0], ja: g.jaTracks >= g.tracks * JA_SHARE, keys: g.keys };
+    const solo = byCount.find(([n]) => !MULTI_ARTIST_RE.test(n));
+    return { id: g.id, name: solo ? solo[0] : null, ja: g.jaTracks >= g.tracks * JA_SHARE, keys: g.keys };
 }
 
 /**
  * iTunes のアーティスト名での曲検索の結果から、利用者のアーティストにあたるものを選ぶ。
  * 同じ名前の別のアーティストを避けるため、利用者の曲と同じ曲名が多いもの（なければ名前が同じもの）を選ぶ。
  * @param names  利用者のデータでのアーティスト名（別の表記を含む）
- * @param titles 利用者のデータでの、そのアーティストの曲名（別の表記を含む）
+ * @param titles 利用者のデータでの、そのアーティストの曲。1 曲ごとに曲名か、曲名と別の表記の配列
  * @returns 確かめられなければ null
  */
 export function pickItunesArtist(results, { names = [], titles = [] }) {
     const groups = itunesArtistGroups(results, names);
-    const uniq = [...new Set(titles.filter(Boolean))];
+    const tracks = titles.map((t) => (Array.isArray(t) ? t : [t]).filter(Boolean)).filter((t) => t.length);
     let best = null;
     for (const g of groups.values()) {
-        const overlap = uniq.filter((t) => g.keys.has(nameKey(t)) || g.keys.has(songKey(t))).length;
+        const overlap = tracks.filter((list) => list.some((t) => g.keys.has(nameKey(t)) || g.keys.has(songKey(t)))).length;
         // 同じ曲名が 2 曲以上、または利用者の曲の半分以上で一致すれば同じアーティストとみなす。名前の一致でもよい
-        const confirmed = g.nameMatch || overlap >= 2 || (overlap >= 1 && overlap * 2 >= uniq.length);
+        const confirmed = g.nameMatch || overlap >= 2 || (overlap >= 1 && overlap * 2 >= tracks.length);
         if (!confirmed) continue;
         // 一致した曲数 → 名前の一致 → 曲数 の順に優先する
         const rank = [overlap, g.nameMatch ? 1 : 0, g.tracks];

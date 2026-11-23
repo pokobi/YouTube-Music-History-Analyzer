@@ -1,6 +1,7 @@
 // 保存データと設定（除外・まとめ）から、集計しやすい形のモデルを作る。
 
 import { dayNumber, dayWeekday, dayParts } from './util.js';
+import { ITUNES_VERSION } from './enrich.js';
 
 const TOPIC_RE = /\s+-\s+Topic$/i;
 
@@ -121,7 +122,9 @@ export function buildModel(dataset, settings, meta = null) {
     for (const a of artists) {
         if (!a.name) a.name = a.key === 'a:?' ? UNKNOWN_ARTIST : a.key.slice(2);
         // 日本語の名前: iTunes で確認できた名前 → Topic チャンネルの名前の順に使う
-        const itName = metaArtists[a.key]?.it?.name;
+        // 古い方式（一致した曲の名義、たとえば共演曲の「A × B」を名前にしていた）で保存した名前は使わない
+        const it = metaArtists[a.key]?.it;
+        const itName = it && it.v === ITUNES_VERSION ? it.name : null;
         const topicName = a.metaNames.size && a.key !== 'a:?' ? [...a.metaNames.entries()].sort((x, y) => y[1] - x[1])[0][0] : null;
         for (const best of [topicName, itName]) {
             if (best && best !== a.name) { a.aliasNames.add(a.name); a.name = best; }

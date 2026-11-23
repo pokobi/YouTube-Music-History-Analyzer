@@ -526,8 +526,9 @@ async function enrichItunes(stop) {
     model.tracks.forEach((t, ti) => {
         if (!model.trackTotal[ti]) return;
         let x = byArtist.get(t.artistIdx);
-        if (!x) byArtist.set(t.artistIdx, (x = { titles: [], todo: [], plays: 0 }));
-        x.titles.push(t.title, ...t.variants);
+        if (!x) byArtist.set(t.artistIdx, (x = { titles: [], all: [], todo: [], plays: 0 }));
+        x.titles.push([t.title, ...t.variants]);
+        x.all.push(ti);
         x.plays += model.trackTotal[ti];
         if (t.v && t.title !== 'タイトル不明' && ASCII_RE.test(t.title) && !checked(meta.tracks[t.v])) x.todo.push(ti);
     });
@@ -540,6 +541,7 @@ async function enrichItunes(stop) {
         // アーティストの照合が要るのは、英字だけの曲名があるか、名前が英字だけのとき
         if (needArtist ? !(x.todo.length || !JA_RE.test(a.name)) : !(it.id && it.ja && x.todo.length)) continue;
         x.todo.sort((p, q) => model.trackTotal[q] - model.trackTotal[p]);
+        x.all.sort((p, q) => model.trackTotal[q] - model.trackTotal[p]);
         items.push({ a, x, needArtist });
     }
     if (!items.length) return;
@@ -554,7 +556,8 @@ async function enrichItunes(stop) {
         sinceRefresh += k;
         if (sinceRefresh >= 10) { sinceRefresh = 0; saveMeta(); refreshFromMeta(); }
     };
-    // 回数制限に達したら 1 分待って 2 回まで再試行する
+    // 回数制限や通信の一時的な失敗（制限中は CORS のヘッダーなしで返り、通信の失敗に見えることがある）は、
+    // 1 分待って 2 回まで再試行する
     const ask = async (fn) => {
         for (let attempt = 0; ; attempt++) {
             try {
@@ -562,7 +565,7 @@ async function enrichItunes(stop) {
                 await sleep(WAIT);
                 return r;
             } catch (err) {
-                if (!err.rate || attempt >= 2) throw err;
+                if (!(err.rate || err.temp) || attempt >= 2) throw err;
                 for (let s = 0; s < 60 && !stop(); s++) await sleep(1000);
                 if (stop()) throw err;
             }
@@ -588,9 +591,11 @@ async function enrichItunes(stop) {
                 try {
                     const results = await ask(() => itunesArtistSongs(a.name));
                     pick = pickItunesArtist(results, { names, titles: x.titles });
-                    // 曲の一覧で確かめられない（手元の曲名がすべて英訳やローマ字など）ときは、曲を検索して確かめる
+                    // 曲の一覧で確かめられない（手元の曲名の多くが英訳やローマ字など）ときは、
+                    // いちばん聴いた 2 曲と、日本語の表記を探す曲の 1 曲目を検索して確かめる（検索結果は曲名の変換にも使う）
                     const groups = pick ? null : itunesArtistGroups(results, names);
-                    for (const ti of groups && groups.size ? x.todo.slice(0, 2) : []) {
+                    const probes = [...new Set([...x.all.slice(0, 2), ...x.todo.slice(0, 1)])];
+                    for (const ti of groups && groups.size ? probes : []) {
                         const found = await ask(() => itunesSearch(`${model.tracks[ti].title} ${a.name}`));
                         searched.set(ti, found);
                         const g = findItunesArtistByTrack(found, groups, model.tracks[ti].title);
@@ -599,7 +604,7 @@ async function enrichItunes(stop) {
                 } catch (err) { await failed(err); progress(1 + x.todo.length); continue; }
                 failures = 0;
                 entry.it = pick
-                    ? { v: ITUNES_VERSION, id: pick.id, ja: pick.ja, name: pick.ja && JA_RE.test(pick.name) ? pick.name : null, at: Date.now() }
+                    ? { v: ITUNES_VERSION, id: pick.id, ja: pick.ja, name: pick.ja && pick.name && JA_RE.test(pick.name) ? pick.name : null, at: Date.now() }
                     : { v: ITUNES_VERSION, id: null, ja: false, name: null, at: Date.now() };
                 keys = pick ? pick.keys : null;
                 progress();

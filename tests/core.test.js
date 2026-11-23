@@ -295,13 +295,17 @@ test('iTunes はアーティスト ID が一致する曲だけを採用し、曲
     const { dataset } = load();
     const meta = {
         tracks: { aaaaaaaaaaa: { t: 'Song A (YT)', a: 'Artist X - Topic', src: 'yt', at: 1, it: 'ソングA', itAt: 1 } },
-        artists: { 'a:artist x': { it: { id: 1, name: 'アーティストX', at: 1 } } },
+        artists: { 'a:artist x': { it: { v: 2, id: 1, ja: true, name: 'アーティストX', at: 1 } } },
     };
     const model = buildModel(dataset, defaultSettings(), meta);
     const a = model.tracks.find((t) => t.v === 'aaaaaaaaaaa');
     assert.equal(a.title, 'ソングA');
     assert.ok(a.variants.includes('Song A') && a.variants.includes('Song A (YT)'));
     assert.equal(model.artists[a.artistIdx].name, 'アーティストX');
+    // 古い方式で保存した名前（共演曲の名義が入っていることがある）は使わない
+    meta.artists['a:artist x'].it = { id: 1, name: 'Artist X × ゲスト', at: 1 };
+    const old = buildModel(dataset, defaultSettings(), meta);
+    assert.equal(old.artists[old.tracks.find((t) => t.v === 'aaaaaaaaaaa').artistIdx].name, 'Artist X');
 });
 
 test('別の版の曲名は、別の版の候補にだけ置き換える', () => {
@@ -367,4 +371,20 @@ test('古い方式で照合したアーティストは照合し直す', () => {
     assert.ok(!needsItunesArtist({ it: { v: ITUNES_VERSION, id: 1, ja: true, name: null, at: now } }, now));
     assert.ok(!needsItunesArtist({ it: { v: ITUNES_VERSION, id: null, at: now } }, now));
     assert.ok(needsItunesArtist({ it: { v: ITUNES_VERSION, id: null, at: now - RETRY_MS - 1 } }, now));
+});
+
+test('同じ曲の別の表記は 1 曲として数え、日本語と英語の両方で一致を探す', () => {
+    // 金木犀（書き出し時は Kinmokusei）と Overdose の 2 曲が一致する
+    assert.equal(pickItunesArtist(natoriResults, { names: ['x'], titles: [['金木犀', 'Kinmokusei'], ['Overdose'], ['A'], ['B']] }).id, 10);
+    // 1 曲の別の表記が両方一致しても 1 曲と数える
+    assert.equal(pickItunesArtist(natoriResults, { names: ['x'], titles: [['Overdose', 'Overdose (Live)'], ['A'], ['B']] }), null);
+});
+
+test('共演の名義しかないアーティストの名前は使わない', () => {
+    const pick = pickItunesArtist([song(40, 'syudou × 八木勇征', '美談'), song(40, 'syudou & SHIMA', 'ハナタバ')], { names: ['syudou'], titles: ['美談', 'ハナタバ'] });
+    assert.equal(pick.id, 40);
+    assert.equal(pick.name, null);
+    // 単独の名前があればそれを使う（いちばん多い名前が共演でも）
+    const solo = pickItunesArtist([song(41, 'Ado & 初音ミク', 'a'), song(41, 'Ado & 初音ミク', 'b'), song(41, 'Ado', 'c')], { names: ['Ado'], titles: ['a'] });
+    assert.equal(solo.name, 'Ado');
 });
