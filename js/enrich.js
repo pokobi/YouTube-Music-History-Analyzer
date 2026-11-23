@@ -4,7 +4,7 @@
 // {
 //   tracks:  { [動画ID]: { t: YouTube の曲名|null, a: チャンネル名|null, src: 'yt'|'none', at,
 //                          it: iTunes の日本語の曲名|''（変わらない）, itAt } },
-//   artists: { [アーティストキー]: { img: Deezer の画像URL|'', imgAt,
+//   artists: { [アーティストキー]: { img: Deezer の画像URL|''（確かめられない・写真なし）, imgAt, imgV: IMAGE_VERSION,
 //                                    it: { v: ITUNES_VERSION, id: iTunes のアーティストID|null,
 //                                          ja: 日本語の曲名が多いアーティストか, name: 日本語の名前|null, at } } },
 // }
@@ -32,15 +32,27 @@ export function needsFetch(entry, now = Date.now()) {
     return false;
 }
 
-/** アーティスト画像をまだ取得していないか */
-export function needsImage(entry, now = Date.now()) {
-    if (!entry || entry.img === undefined) return true;
-    if (entry.img === '') return now - (entry.imgAt || 0) > RETRY_MS;
-    return false;
-}
-
 // iTunes でのアーティストの照合方法の版。変えたら、古い版の結果は照合し直す
 export const ITUNES_VERSION = 2;
+// アーティスト画像の照合方法の版（1: 名前だけ、2: よく聴いた曲で本人を確かめる）。古い版の画像は使わない
+export const IMAGE_VERSION = 2;
+
+/** 今の方式で取得したアーティスト画像（なければ null）。'' は「確かめられなかった」 */
+export function artistImageOf(entry) {
+    return entry && entry.imgV === IMAGE_VERSION ? entry.img : null;
+}
+
+/** アーティスト画像をまだ取得していないか */
+export function needsImage(entry, now = Date.now()) {
+    if (!entry || entry.imgV !== IMAGE_VERSION || entry.img === undefined) return true;
+    if (entry.img === '') {
+        if (now - (entry.imgAt || 0) > RETRY_MS) return true;
+        // iTunes で日本語の名前や曲名が分かったのが画像を探したあとなら、もう一度探す
+        const it = entry.it;
+        return !!(it && it.v === ITUNES_VERSION && it.id && it.at > (entry.imgAt || 0));
+    }
+    return false;
+}
 // 曲の一覧のうち日本語の曲名がこの割合以上なら、日本のアーティストとして扱う
 export const JA_SHARE = 0.25;
 
@@ -163,12 +175,61 @@ export function findItunesArtistByTrack(results, groups, title) {
     return hit ? groups.get(hit.artistId) : null;
 }
 
-/** Deezer の検索結果から、名前が一致するアーティストの画像を選ぶ */
-export function pickDeezerArtist(data, names) {
-    const keys = new Set(names.map(nameKey).filter(Boolean));
-    const hits = (data || []).filter((d) => d && keys.has(nameKey(d.name)) && d.picture_medium && !/\/images\/artist\/\//.test(d.picture_medium));
-    hits.sort((a, b) => (b.nb_fan || 0) - (a.nb_fan || 0));
-    return hits.length ? hits[0].picture_medium : '';
+// カラオケ・カバー・オルゴールなど、本人以外が出している版の付記
+const COPY_RE = /原曲|originally performed|performed by|cover|カバー|karaoke|カラオケ|オルゴール|orgel|music ?box|[+-]\s?\d+\s?key|歌ってみた|tribute/i;
+
+/**
+ * Deezer の曲検索（「曲名 アーティスト名」）の結果から、本人の曲の候補を集める。
+ * @param titles 利用者のデータでのその曲の表記（日本語・英語など）
+ * @param names  利用者のデータでのアーティスト名（別の表記を含む）
+ * @returns {Map<id, {picture, titleMatch, nameMatch}>} Deezer のアーティスト ID ごと
+ */
+export function deezerTrackCandidates(results, { titles = [], names = [] }) {
+    const titleKeys = new Set(titles.map(nameKey).filter(Boolean));
+    const nameKeys = new Set(names.map(nameKey).filter(Boolean));
+    const out = new Map();
+    for (const r of results || []) {
+        const a = r && r.artist;
+        if (!a || !a.id || !r.title || COPY_RE.test(r.title)) continue;
+        const c = out.get(a.id) || { picture: '', titleMatch: false, nameMatch: false };
+        if (!c.picture && a.picture_medium && !/\/images\/artist\/\//.test(a.picture_medium)) c.picture = a.picture_medium;
+        if (titleKeys.has(nameKey(r.title))) c.titleMatch = true;
+        if (nameKeys.has(nameKey(a.name))) c.nameMatch = true;
+        out.set(a.id, c);
+    }
+    return out;
+}
+
+/**
+ * よく聴いた曲（1〜2 曲）の検索結果から、アーティスト本人を確かめて画像を選ぶ。
+ * 同じ名前の別のアーティストを避けるため、次のどちらかで確かめられた場合だけ採用する。
+ *   1. ある曲で、曲名もアーティスト名も一致する
+ *   2. 2 曲の検索の両方に同じアーティストが出て、名前か、どちらかの曲名が一致する（表記違いの名前など）
+ * @param searches [{ results, titles }] 曲ごとの検索結果と、その曲の表記
+ * @returns {{confirmed: boolean, img: string}} 確かめられなければ confirmed: false
+ */
+export function pickDeezerByTracks(searches, names) {
+    const lists = searches.map((s) => deezerTrackCandidates(s.results, { titles: s.titles, names }));
+    for (const list of lists) {
+        for (const c of list.values()) if (c.titleMatch && c.nameMatch) return { confirmed: true, img: c.picture };
+    }
+    if (lists.length >= 2) {
+        for (const [id, c] of lists[0]) {
+            const others = lists.slice(1).map((l) => l.get(id));
+            if (others.some((o) => !o)) continue;
+            const all = [c, ...others];
+            if (all.some((x) => x.nameMatch) || all.some((x) => x.titleMatch)) {
+                return { confirmed: true, img: all.map((x) => x.picture).find(Boolean) || '' };
+            }
+        }
+    }
+    return { confirmed: false, img: '' };
+}
+
+/** 検索に使う表記を選ぶ（Deezer は英語・ローマ字の表記でよく見つかるため、英字だけの表記を優先する） */
+export function searchTermOf(list) {
+    const xs = list.filter(Boolean);
+    return xs.find((x) => ASCII_RE.test(x)) || xs[0] || '';
 }
 
 // --- 通信 ---
@@ -233,8 +294,8 @@ export function itunesArtistSongs(name) {
 
 let jsonpSeq = 0;
 
-/** Deezer は CORS に対応していないため JSONP で呼ぶ */
-export function deezerArtistSearch(name) {
+/** Deezer で曲を検索する（「曲名 アーティスト名」）。CORS に対応していないため JSONP で呼ぶ */
+export function deezerTrackSearch(q) {
     return new Promise((resolve, reject) => {
         const cb = `__dz${Date.now().toString(36)}${++jsonpSeq}`;
         const script = document.createElement('script');
@@ -254,7 +315,7 @@ export function deezerArtistSearch(name) {
                 done(null, (data && data.data) || []);
             }
         };
-        script.src = `https://api.deezer.com/search/artist?${new URLSearchParams({ q: name, limit: '10', output: 'jsonp', callback: cb })}`;
+        script.src = `https://api.deezer.com/search?${new URLSearchParams({ q, limit: '25', output: 'jsonp', callback: cb })}`;
         script.referrerPolicy = 'no-referrer';
         script.onerror = () => done(new Error('network'));
         document.head.appendChild(script);

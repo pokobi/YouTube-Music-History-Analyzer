@@ -5,7 +5,7 @@ import { icon } from './icons.js';
 import { parseFile } from './parser.js';
 import { emptyDataset, mergeEntries, buildBackup } from './dataset.js';
 import { buildModel, defaultSettings, normalizeSettings, artistKeyOf, resolveAlias, findMergeCandidates } from './model.js';
-import { emptyMeta, normalizeMeta, needsFetch, needsImage, needsItunesArtist, RETRY_MS, ITUNES_VERSION, JA_RE, ASCII_RE, nameKey, songKey, ytVideos, ytOembed, itunesSearch, itunesArtistSongs, deezerArtistSearch, pickItunes, pickItunesArtist, itunesArtistGroups, summarizeItunesArtist, findItunesArtistByTrack, pickDeezerArtist, runPool, sleep } from './enrich.js';
+import { emptyMeta, normalizeMeta, needsFetch, needsImage, needsItunesArtist, RETRY_MS, ITUNES_VERSION, JA_RE, ASCII_RE, nameKey, songKey, ytVideos, ytOembed, itunesSearch, itunesArtistSongs, deezerTrackSearch, deezerTrackCandidates, pickDeezerByTracks, searchTermOf, IMAGE_VERSION, pickItunes, pickItunesArtist, itunesArtistGroups, summarizeItunesArtist, findItunesArtistByTrack, runPool, sleep } from './enrich.js';
 import { computeStats, computeRanks, computeHighlights, parsePeriod, encodePeriod, periodRange, previousRange, trackDetail, artistDetail, dayDetail } from './stats.js';
 import { getValue, setValues, clearAll, readLegacyEntries } from './store.js';
 import * as V from './views.js';
@@ -419,6 +419,8 @@ async function enrich() {
         await enrichTitles(stop);
         if (!stop()) await enrichArtists(stop);
         if (!stop()) await enrichItunes(stop);
+        // iTunes で日本語の名前や曲名が分かり、画像を確かめられなかったアーティストをもう一度探す
+        if (!stop()) await enrichArtists(stop);
     } catch (err) {
         console.error(err);
     } finally {
@@ -639,31 +641,73 @@ async function enrichItunes(stop) {
     refreshFromMeta();
 }
 
+/**
+ * アーティスト画像を Deezer から取得する。
+ * 同じ名前の別のアーティストを避けるため、よく聴いた曲（2 曲まで）を検索し、本人の曲が見つかったときだけ
+ * その曲のアーティストの写真を使う（pickDeezerByTracks）。確かめられなければ写真は使わない（曲のジャケットを表示）
+ */
 async function enrichArtists(stop) {
+    refreshFromMeta(true);
     const model = state.model;
     const meta = state.extMeta;
+    // アーティストごとに、よく聴いた曲を 2 曲まで集める
+    const tops = new Map();
     const totals = new Map();
-    model.tracks.forEach((t, ti) => totals.set(t.artistIdx, (totals.get(t.artistIdx) || 0) + model.trackTotal[ti]));
+    model.tracks.forEach((t, ti) => {
+        const n = model.trackTotal[ti];
+        if (!n) return;
+        totals.set(t.artistIdx, (totals.get(t.artistIdx) || 0) + n);
+        if (t.title === 'タイトル不明') return;
+        const list = tops.get(t.artistIdx) || [];
+        list.push(ti);
+        list.sort((x, y) => model.trackTotal[y] - model.trackTotal[x]);
+        tops.set(t.artistIdx, list.slice(0, 2));
+    });
     const items = model.artists
-        .map((a, ai) => ({ a, n: totals.get(ai) || 0 }))
-        .filter(({ a, n }) => n > 0 && a.key !== 'a:?' && needsImage(meta.artists[a.key]))
-        .sort((x, y) => y.n - x.n)
-        .map(({ a }) => a);
+        .map((a, ai) => ({ a, n: totals.get(ai) || 0, tracks: tops.get(ai) || [] }))
+        .filter(({ a, n, tracks }) => n > 0 && tracks.length && a.key !== 'a:?' && needsImage(meta.artists[a.key]))
+        .sort((x, y) => y.n - x.n);
     if (!items.length) return;
 
     state.enrich = { label: 'アーティスト画像', done: 0, total: items.length };
     setEnrichStatus();
     let sinceSave = 0;
-    await runPool(items, 2, async (a) => {
-        for (let attempt = 0; attempt < 2; attempt++) {
-            try {
-                const data = await deezerArtistSearch(a.name);
-                meta.artists[a.key] = { ...(meta.artists[a.key] || {}), img: pickDeezerArtist(data, [a.name, ...a.aliasNames]), imgAt: Date.now() };
-                break;
-            } catch (err) {
-                if (!err.rate) break;
-                await sleep(5000);
+    // 回数制限（5 秒あたり 50 回）にかかったら 5 秒待って 1 回だけやり直す
+    const search = async (q) => {
+        try {
+            return await deezerTrackSearch(q);
+        } catch (err) {
+            if (!err.rate) throw err;
+            await sleep(5000);
+            return deezerTrackSearch(q);
+        }
+    };
+    await runPool(items, 2, async ({ a, tracks }) => {
+        const names = [a.name, ...a.aliasNames];
+        const artistTerm = searchTermOf(names);
+        const searches = [];
+        let pick = { confirmed: false, img: '' };
+        try {
+            for (const ti of tracks) {
+                const t = model.tracks[ti];
+                const titles = [t.title, ...t.variants];
+                // 英字の表記で探し、そのアーティストの曲が出なければ日本語の表記でも探す
+                // （Deezer は曲によって、英語・ローマ字と日本語のどちらかでしか見つからない）
+                const terms = [...new Set([searchTermOf(titles), titles.find((x) => x && !ASCII_RE.test(x))].filter(Boolean))];
+                const s = { results: [], titles };
+                searches.push(s);
+                for (const term of terms) {
+                    s.results.push(...await search(`${term} ${artistTerm}`));
+                    pick = pickDeezerByTracks(searches, names);
+                    if (pick.confirmed) break;
+                    await sleep(250);
+                    if ([...deezerTrackCandidates(s.results, { titles, names }).values()].some((c) => c.nameMatch)) break;
+                }
+                if (pick.confirmed) break;
             }
+            meta.artists[a.key] = { ...(meta.artists[a.key] || {}), img: pick.img, imgAt: Date.now(), imgV: IMAGE_VERSION };
+        } catch {
+            // 通信の失敗は記録せず、次に開いたときにもう一度探す
         }
         state.enrich.done++;
         setEnrichStatus();
@@ -1130,7 +1174,7 @@ function onClick(e) {
         case 'retry-meta':
             // 取れなかったものの記録を消して、もう一度問い合わせる
             for (const [k, v] of Object.entries(state.extMeta.tracks)) if (v.src === 'none') delete state.extMeta.tracks[k];
-            for (const [k, v] of Object.entries(state.extMeta.artists)) if (!v.img) delete state.extMeta.artists[k];
+            for (const v of Object.values(state.extMeta.artists)) if (!v.img) { delete v.img; delete v.imgAt; delete v.imgV; }
             saveMeta().then(() => enrich());
             toast('取得できなかったものを、もう一度問い合わせます。');
             break;

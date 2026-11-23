@@ -5,6 +5,7 @@ import { icon } from './icons.js';
 import { barChart, calendarHeatmap, weekHourHeatmap, donutChart, monthItems, dayItems } from './charts.js';
 import { previousLabel, monthOfDay, rankByTime } from './stats.js';
 import { resolveAlias, findMergeCandidates } from './model.js';
+import { artistImageOf } from './enrich.js';
 
 export const TABS = [
     ['overview', '概要'],
@@ -36,7 +37,7 @@ function initial(name) {
 export function avatar(state, a, size = '') {
     if (state.settings.showThumbnails) {
         const ch = a.channelId ? state.channelImages[a.channelId] : null;
-        const dz = state.settings.fetchMeta ? state.extMeta.artists[a.key]?.img : null;
+        const dz = state.settings.fetchMeta ? artistImageOf(state.extMeta.artists[a.key]) : null;
         const src = ch || dz || (a.imageV ? `https://i.ytimg.com/vi/${a.imageV}/mqdefault.jpg` : null);
         if (src) {
             return html`<span class="avatar ${size}" aria-hidden="true" data-initial="${initial(a.name)}"><img src="${src}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer"></span>`;
@@ -541,7 +542,10 @@ export function dataView(state) {
     const channelCount = new Set(model.artists.map((a) => a.channelId).filter(Boolean)).size;
     const metaStats = { videos: new Set(state.dataset.tracks.map((t) => t.v).filter(Boolean)).size, titles: 0, failed: 0, images: 0 };
     for (const v of Object.values(state.extMeta.tracks)) { if (v.t) metaStats.titles++; else metaStats.failed++; }
-    for (const v of Object.values(state.extMeta.artists)) { if (v.img) metaStats.images++; else metaStats.failed++; }
+    for (const v of Object.values(state.extMeta.artists)) {
+        const img = artistImageOf(v);
+        if (img) metaStats.images++; else if (img === '') metaStats.failed++;
+    }
     const fetched = Object.values(state.channelImages).filter(Boolean).length;
 
     return html`
@@ -597,7 +601,7 @@ export function dataView(state) {
             <p class="note">英語やローマ字で書き出された曲名を、YouTube に登録されている元の表記（原題）に置き換えます。書き出されたときの表記は「別の表記」として残り、検索にも使えます。</p>
             <ul class="notes">
                 <li>曲名とアーティスト名: YouTube（動画 ID を送信）。YouTube でも英語やローマ字で登録されているものは、iTunes Search API（アーティスト名と曲名を送信）で日本語の表記を探します。iTunes の曲の一覧と照らしてアーティストが一致し、日本語の曲名が多いアーティストの場合だけ使います。</li>
-                <li>アーティスト画像: Deezer（アーティスト名を送信）。名前が一致した場合だけ使います。</li>
+                <li>アーティスト画像: Deezer（アーティスト名と、よく聴いた曲の曲名を送信）。よく聴いた曲で本人の曲を確かめられた場合だけ使い、確かめられなければ曲のジャケットを表示します。</li>
                 <li>オフにすると問い合わせを止め、書き出されたときの表記で表示します。</li>
             </ul>
         `)}

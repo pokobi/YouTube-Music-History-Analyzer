@@ -218,7 +218,7 @@ test('集中して聴いた期間と 1 日の詳細', () => {
 
 // --- 原題・画像の取得（照合ルール） ---
 
-import { nameKey, isVariantTitle, pickItunes, pickDeezerArtist, needsFetch, RETRY_MS } from '../js/enrich.js';
+import { nameKey, isVariantTitle, pickItunes, pickDeezerByTracks, searchTermOf, needsFetch, needsImage, artistImageOf, IMAGE_VERSION, RETRY_MS } from '../js/enrich.js';
 
 test('名前の照合キーと、別の版の判定', () => {
     assert.equal(nameKey('Kenshi Yonezu - Topic'), nameKey('kenshi yonezu'));
@@ -243,14 +243,70 @@ test('iTunes の候補は、アーティストが一致し別の版でないも�
     assert.equal(pickItunes([{ trackName: 'Lemon', artistName: '米津玄師' }], { title: 'Lemon', artistNames: ['Kenshi Yonezu', '米津玄師'] }), null);
 });
 
-test('Deezer の候補は名前が一致し、画像があるものだけ使う', () => {
-    const data = [
-        { name: 'YOASOBI', picture_medium: 'https://cdn/images/artist/abc/250x250.jpg', nb_fan: 10 },
-        { name: 'YOASOBI', picture_medium: 'https://cdn/images/artist//250x250.jpg', nb_fan: 99 },
-        { name: 'Yoasobi Cover', picture_medium: 'https://cdn/images/artist/zzz/250x250.jpg', nb_fan: 999 },
+// Deezer の曲検索の結果（実際の応答を縮めたもの）
+const dz = (title, id, name, pic = `https://cdn/images/artist/${id}/250x250.jpg`) => ({ title, artist: { id, name, picture_medium: pic } });
+
+test('Deezer は、曲名とアーティスト名が一致する本人の曲の写真を使う', () => {
+    const results = [
+        dz('Shape of You (Galantis Remix)', 1, 'Ed Sheeran'),
+        dz('Shape of You', 2, 'Ed Sheeran Tribute Band'),
+        dz('Shape of You', 1, 'Ed Sheeran'),
     ];
-    assert.equal(pickDeezerArtist(data, ['YOASOBI']), 'https://cdn/images/artist/abc/250x250.jpg');
-    assert.equal(pickDeezerArtist(data, ['Ado']), '');
+    assert.deepEqual(pickDeezerByTracks([{ results, titles: ['Shape of You'] }], ['Ed Sheeran']), { confirmed: true, img: 'https://cdn/images/artist/1/250x250.jpg' });
+    // 同じ名前でも、その曲を出していなければ使わない
+    assert.equal(pickDeezerByTracks([{ results: [dz('Other Song', 9, 'Ed Sheeran')], titles: ['Shape of You'] }], ['Ed Sheeran']).confirmed, false);
+});
+
+test('Deezer は、カラオケやカバーの曲を本人の曲とみなさない', () => {
+    const results = [
+        dz('キュートなカノジョ (原曲歌手: syudou)', 5, '歌っちゃ王'),
+        dz('Overdose (Cover) [オリジナル歌手：なとり]', 6, 'MF Mobile Melody Creators'),
+    ];
+    const pick = pickDeezerByTracks([
+        { results, titles: ['キュートなカノジョ'] },
+        { results, titles: ['Overdose'] },
+    ], ['syudou', '歌っちゃ王']);
+    assert.equal(pick.confirmed, false);
+});
+
+test('Deezer で名前の表記が違うアーティストは、2 曲で同じアーティストが出れば使う', () => {
+    // natori（Deezer では「なとり」）: 2 曲とも曲名が一致
+    const a = [dz('Overdose', 10, 'なとり'), dz('Overdose', 11, 'Raon')];
+    const b = [dz('Sleepwalk', 10, 'なとり'), dz('SLEEPWALK', 12, 'ヒトリエ')];
+    assert.deepEqual(pickDeezerByTracks([{ results: a, titles: ['Overdose'] }, { results: b, titles: ['Sleepwalk'] }], ['natori']), { confirmed: true, img: 'https://cdn/images/artist/10/250x250.jpg' });
+    // 1 曲だけでは使わない
+    assert.equal(pickDeezerByTracks([{ results: a, titles: ['Overdose'] }], ['natori']).confirmed, false);
+    // Ado: 曲名は英訳（Show → 唱）だが、名前が一致する同じアーティストが 2 曲で出る
+    const c = [dz('唱', 20, 'Ado')];
+    const d = [dz('うっせぇわ', 20, 'Ado'), dz('うっせぇわ', 21, 'Amelia Khor')];
+    assert.equal(pickDeezerByTracks([{ results: c, titles: ['Show'] }, { results: d, titles: ['Usseewa'] }], ['Ado']).img, 'https://cdn/images/artist/20/250x250.jpg');
+    // 名前も曲名も一致しなければ、2 曲で出ても使わない
+    assert.equal(pickDeezerByTracks([{ results: c, titles: ['Show'] }, { results: d, titles: ['Usseewa'] }], ['Someone']).confirmed, false);
+});
+
+test('Deezer で本人を確かめられても写真がなければ空にする', () => {
+    const results = [dz('Song', 30, 'Minor Artist', 'https://cdn/images/artist//250x250.jpg')];
+    assert.deepEqual(pickDeezerByTracks([{ results, titles: ['Song'] }], ['Minor Artist']), { confirmed: true, img: '' });
+});
+
+test('検索には英字だけの表記を優先して使う', () => {
+    assert.equal(searchTermOf(['唱', 'Show']), 'Show');
+    assert.equal(searchTermOf(['なとり', 'natori']), 'natori');
+    assert.equal(searchTermOf(['夜に駆ける']), '夜に駆ける');
+});
+
+test('古い方式の画像は使わず、取り直す', () => {
+    const now = Date.now();
+    const old = { img: 'https://cdn/x.jpg', imgAt: now };
+    assert.equal(artistImageOf(old), null);
+    assert.ok(needsImage(old, now));
+    const cur = { img: 'https://cdn/x.jpg', imgAt: now, imgV: IMAGE_VERSION };
+    assert.equal(artistImageOf(cur), 'https://cdn/x.jpg');
+    assert.ok(!needsImage(cur, now));
+    // 確かめられなかったものは、iTunes で名前が分かったあとに 1 回だけ探し直す
+    const none = { img: '', imgAt: now - 10, imgV: IMAGE_VERSION, it: { v: 2, id: 1, at: now } };
+    assert.ok(needsImage(none, now));
+    assert.ok(!needsImage({ ...none, imgAt: now + 1 }, now));
 });
 
 test('取得できなかったものは一定期間たってから再取得する', () => {
