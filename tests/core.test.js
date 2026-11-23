@@ -252,7 +252,7 @@ test('Deezer は、曲名とアーティスト名が一致する本人の曲の�
         dz('Shape of You', 2, 'Ed Sheeran Tribute Band'),
         dz('Shape of You', 1, 'Ed Sheeran'),
     ];
-    assert.deepEqual(pickDeezerByTracks([{ results, titles: ['Shape of You'] }], ['Ed Sheeran']), { confirmed: true, img: 'https://cdn/images/artist/1/250x250.jpg' });
+    assert.deepEqual(pickDeezerByTracks([{ results, titles: ['Shape of You'] }], ['Ed Sheeran']), { confirmed: true, img: 'https://cdn/images/artist/1/250x250.jpg', id: 1 });
     // 同じ名前でも、その曲を出していなければ使わない
     assert.equal(pickDeezerByTracks([{ results: [dz('Other Song', 9, 'Ed Sheeran')], titles: ['Shape of You'] }], ['Ed Sheeran']).confirmed, false);
 });
@@ -273,7 +273,7 @@ test('Deezer で名前の表記が違うアーティストは、2 曲で同じ�
     // natori（Deezer では「なとり」）: 2 曲とも曲名が一致
     const a = [dz('Overdose', 10, 'なとり'), dz('Overdose', 11, 'Raon')];
     const b = [dz('Sleepwalk', 10, 'なとり'), dz('SLEEPWALK', 12, 'ヒトリエ')];
-    assert.deepEqual(pickDeezerByTracks([{ results: a, titles: ['Overdose'] }, { results: b, titles: ['Sleepwalk'] }], ['natori']), { confirmed: true, img: 'https://cdn/images/artist/10/250x250.jpg' });
+    assert.deepEqual(pickDeezerByTracks([{ results: a, titles: ['Overdose'] }, { results: b, titles: ['Sleepwalk'] }], ['natori']), { confirmed: true, img: 'https://cdn/images/artist/10/250x250.jpg', id: 10 });
     // 1 曲だけでは使わない
     assert.equal(pickDeezerByTracks([{ results: a, titles: ['Overdose'] }], ['natori']).confirmed, false);
     // Ado: 曲名は英訳（Show → 唱）だが、名前が一致する同じアーティストが 2 曲で出る
@@ -286,7 +286,7 @@ test('Deezer で名前の表記が違うアーティストは、2 曲で同じ�
 
 test('Deezer で本人を確かめられても写真がなければ空にする', () => {
     const results = [dz('Song', 30, 'Minor Artist', 'https://cdn/images/artist//250x250.jpg')];
-    assert.deepEqual(pickDeezerByTracks([{ results, titles: ['Song'] }], ['Minor Artist']), { confirmed: true, img: '' });
+    assert.deepEqual(pickDeezerByTracks([{ results, titles: ['Song'] }], ['Minor Artist']), { confirmed: true, img: '', id: 30 });
 });
 
 test('検索には英字だけの表記を優先して使う', () => {
@@ -300,9 +300,11 @@ test('古い方式の画像は使わず、取り直す', () => {
     const old = { img: 'https://cdn/x.jpg', imgAt: now };
     assert.equal(artistImageOf(old), null);
     assert.ok(needsImage(old, now));
-    const cur = { img: 'https://cdn/x.jpg', imgAt: now, imgV: IMAGE_VERSION };
+    const cur = { img: 'https://cdn/x.jpg', imgAt: now, imgV: IMAGE_VERSION, dzId: 5 };
     assert.equal(artistImageOf(cur), 'https://cdn/x.jpg');
     assert.ok(!needsImage(cur, now));
+    // Deezer のアーティスト ID を記録していない画像は取り直す（Wikidata の照合に使う）
+    assert.ok(needsImage({ ...cur, dzId: undefined }, now));
     // 確かめられなかったものは、iTunes で名前が分かったあとに 1 回だけ探し直す
     const none = { img: '', imgAt: now - 10, imgV: IMAGE_VERSION, it: { v: 2, id: 1, at: now } };
     assert.ok(needsImage(none, now));
@@ -443,4 +445,85 @@ test('共演の名義しかないアーティストの名前は使わない', ()
     // 単独の名前があればそれを使う（いちばん多い名前が共演でも）
     const solo = pickItunesArtist([song(41, 'Ado & 初音ミク', 'a'), song(41, 'Ado & 初音ミク', 'b'), song(41, 'Ado', 'c')], { names: ['Ado'], titles: ['a'] });
     assert.equal(solo.name, 'Ado');
+});
+
+import { WIKIDATA_VERSION, wikidataKeyOf, needsWikidata, wikidataImageOf, wikidataQuery, parseWikidataImages, commonsFileName, stripHtml, parseCommonsInfo } from '../js/enrich.js';
+
+test('Wikidata の照合キーは、照合済みの Apple と Deezer のアーティスト ID から作る', () => {
+    const now = Date.now();
+    assert.equal(wikidataKeyOf(undefined), '');
+    assert.equal(wikidataKeyOf({ img: '', imgV: IMAGE_VERSION }), '');
+    assert.equal(wikidataKeyOf({ it: { v: ITUNES_VERSION, id: 962221033 }, imgV: IMAGE_VERSION, dzId: 8152202 }), '962221033/8152202');
+    // 古い版の照合結果は使わない
+    assert.equal(wikidataKeyOf({ it: { v: ITUNES_VERSION - 1, id: 1 }, imgV: IMAGE_VERSION, dzId: 2 }), '/2');
+    assert.equal(wikidataKeyOf({ it: { v: ITUNES_VERSION, id: 1 }, imgV: IMAGE_VERSION - 1, dzId: 2 }), '1/');
+
+    const entry = { it: { v: ITUNES_VERSION, id: 1 }, imgV: IMAGE_VERSION, dzId: 2 };
+    assert.ok(needsWikidata(entry, now));
+    assert.ok(!needsWikidata({}, now));
+    const wd = { v: WIKIDATA_VERSION, key: '1/2', img: 'https://upload/x.jpg', author: 'A', license: 'CC BY 3.0', at: now };
+    assert.ok(!needsWikidata({ ...entry, wd }, now));
+    // ID が変わったら調べ直し、写真は使わない
+    const moved = { ...entry, dzId: 3, wd };
+    assert.ok(needsWikidata(moved, now));
+    assert.equal(wikidataImageOf(moved), null);
+    // 30 日たったら調べ直す
+    assert.ok(needsWikidata({ ...entry, wd: { ...wd, at: now - RETRY_MS - 1 } }, now));
+    assert.ok(needsWikidata({ ...entry, wd: { ...wd, v: WIKIDATA_VERSION + 1 } }, now));
+
+    assert.equal(wikidataImageOf({ ...entry, wd }), wd);
+    assert.equal(wikidataImageOf({ ...entry, wd: { ...wd, img: '' } }), null);
+    assert.equal(wikidataImageOf(undefined), null);
+});
+
+test('Wikidata の問い合わせには数字の ID だけを入れる', () => {
+    const q = wikidataQuery(['962221033', '1"} ?x ?y {', 'abc'], [8152202]);
+    assert.ok(q.includes('"962221033"'));
+    assert.ok(q.includes('"8152202"'));
+    assert.ok(!q.includes('abc'));
+    assert.ok(!q.includes('?x'));
+    assert.ok(q.includes('wdt:P2850') && q.includes('wdt:P2722') && q.includes('wdt:P18'));
+    assert.ok(!wikidataQuery([], ['x']).includes('P2722'));
+    assert.equal(wikidataQuery([], []), '');
+    assert.ok(!wikidataQuery(['1'], []).includes('UNION'));
+});
+
+test('Wikidata の結果を ID ごとのファイル名にする', () => {
+    const json = { results: { bindings: [
+        { apple: { value: '962221033' }, image: { value: 'http://commons.wikimedia.org/wiki/Special:FilePath/Mrs.%20Green%20Apple%20in%20Seoul.jpg' } },
+        { apple: { value: '962221033' }, image: { value: 'http://commons.wikimedia.org/wiki/Special:FilePath/Second.jpg' } },
+        { deezer: { value: '8152202' }, image: { value: 'http://commons.wikimedia.org/wiki/Special:FilePath/yoasobi_live.jpg' } },
+        { deezer: { value: '1' } },
+    ] } };
+    const r = parseWikidataImages(json);
+    assert.equal(r.apple.get('962221033'), 'Mrs. Green Apple in Seoul.jpg');
+    assert.equal(r.deezer.get('8152202'), 'Yoasobi live.jpg');
+    assert.ok(!r.deezer.has('1'));
+    assert.equal(parseWikidataImages({}).apple.size, 0);
+    assert.equal(commonsFileName(''), '');
+    assert.equal(commonsFileName('http://x/Special:FilePath/%E3%83%9F%E3%82%BB%E3%82%B9_1.jpg'), 'ミセス 1.jpg');
+});
+
+test('Commons の情報から、写真・作者・ライセンスを取り出す', () => {
+    assert.equal(stripHtml('<a href="//x">K-POPIT 케이팝잇</a>'), 'K-POPIT 케이팝잇');
+    assert.equal(stripHtml('A &amp; B &#39;C&#39; &#x41;'), "A & B 'C' A");
+    assert.equal(stripHtml('x'.repeat(100)).length, 80);
+    const json = { query: { pages: {
+        1: { title: 'File:Mrs. Green Apple in Seoul.jpg', imageinfo: [{
+            thumburl: 'https://upload.wikimedia.org/a/300px-x.jpg', descriptionurl: 'https://commons.wikimedia.org/wiki/File:x.jpg',
+            extmetadata: { Artist: { value: '<a href="//x">K-POPIT</a>' }, LicenseShortName: { value: 'CC BY 3.0' }, LicenseUrl: { value: 'https://creativecommons.org/licenses/by/3.0' } },
+        }] },
+        2: { title: 'File:Bad.jpg', imageinfo: [{ thumburl: 'javascript:alert(1)', descriptionurl: 'javascript:alert(1)', extmetadata: {} }] },
+        3: { title: 'File:NoMeta.jpg', imageinfo: [{ thumburl: 'https://upload/y.jpg', descriptionurl: 'javascript:alert(1)', extmetadata: { LicenseUrl: { value: 'javascript:x' } } }] },
+        '-1': { title: 'File:Missing.jpg', missing: '' },
+    } } };
+    const m = parseCommonsInfo(json);
+    assert.deepEqual(m.get('Mrs. Green Apple in Seoul.jpg'), {
+        img: 'https://upload.wikimedia.org/a/300px-x.jpg', page: 'https://commons.wikimedia.org/wiki/File:x.jpg',
+        author: 'K-POPIT', license: 'CC BY 3.0', licenseUrl: 'https://creativecommons.org/licenses/by/3.0',
+    });
+    // https 以外の URL は使わない
+    assert.ok(!m.has('Bad.jpg'));
+    assert.deepEqual(m.get('NoMeta.jpg'), { img: 'https://upload/y.jpg', page: '', author: '不明', license: '', licenseUrl: '' });
+    assert.ok(!m.has('Missing.jpg'));
 });

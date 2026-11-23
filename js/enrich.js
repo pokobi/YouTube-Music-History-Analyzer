@@ -4,7 +4,9 @@
 // {
 //   tracks:  { [動画ID]: { t: YouTube の曲名|null, a: チャンネル名|null, src: 'yt'|'none', at,
 //                          it: iTunes の日本語の曲名|''（変わらない）, itAt } },
-//   artists: { [アーティストキー]: { img: Deezer の画像URL|''（確かめられない・写真なし）, imgAt, imgV: IMAGE_VERSION,
+//   artists: { [アーティストキー]: { img: Deezer の画像URL|''（確かめられない・写真なし）, imgAt, imgV: IMAGE_VERSION, dzId: Deezer のアーティストID,
+//                                    wd: { v: WIKIDATA_VERSION, key: 照合に使った ID, img: Wikimedia Commons の写真の縮小版URL|'',
+//                                          page: 写真のページ, author, license, licenseUrl, at },
 //                                    it: { v: ITUNES_VERSION, id: iTunes のアーティストID|null,
 //                                          ja: 日本語の曲名が多いアーティストか, name: 日本語の名前|null, at } } },
 // }
@@ -45,6 +47,7 @@ export function artistImageOf(entry) {
 /** アーティスト画像をまだ取得していないか */
 export function needsImage(entry, now = Date.now()) {
     if (!entry || entry.imgV !== IMAGE_VERSION || entry.img === undefined) return true;
+    if (entry.img && !entry.dzId) return true;
     if (entry.img === '') {
         if (now - (entry.imgAt || 0) > RETRY_MS) return true;
         // iTunes で日本語の名前や曲名が分かったのが画像を探したあとなら、もう一度探す
@@ -182,7 +185,7 @@ const COPY_RE = /原曲|originally performed|performed by|cover|カバー|karaok
  * Deezer の曲検索（「曲名 アーティスト名」）の結果から、本人の曲の候補を集める。
  * @param titles 利用者のデータでのその曲の表記（日本語・英語など）
  * @param names  利用者のデータでのアーティスト名（別の表記を含む）
- * @returns {Map<id, {picture, titleMatch, nameMatch}>} Deezer のアーティスト ID ごと
+ * @returns {Map<id, {id, picture, titleMatch, nameMatch}>} Deezer のアーティスト ID ごと
  */
 export function deezerTrackCandidates(results, { titles = [], names = [] }) {
     const titleKeys = new Set(titles.map(nameKey).filter(Boolean));
@@ -191,7 +194,7 @@ export function deezerTrackCandidates(results, { titles = [], names = [] }) {
     for (const r of results || []) {
         const a = r && r.artist;
         if (!a || !a.id || !r.title || COPY_RE.test(r.title)) continue;
-        const c = out.get(a.id) || { picture: '', titleMatch: false, nameMatch: false };
+        const c = out.get(a.id) || { id: a.id, picture: '', titleMatch: false, nameMatch: false };
         if (!c.picture && a.picture_medium && !/\/images\/artist\/\//.test(a.picture_medium)) c.picture = a.picture_medium;
         if (titleKeys.has(nameKey(r.title))) c.titleMatch = true;
         if (nameKeys.has(nameKey(a.name))) c.nameMatch = true;
@@ -206,12 +209,12 @@ export function deezerTrackCandidates(results, { titles = [], names = [] }) {
  *   1. ある曲で、曲名もアーティスト名も一致する
  *   2. 2 曲の検索の両方に同じアーティストが出て、名前か、どちらかの曲名が一致する（表記違いの名前など）
  * @param searches [{ results, titles }] 曲ごとの検索結果と、その曲の表記
- * @returns {{confirmed: boolean, img: string}} 確かめられなければ confirmed: false
+ * @returns {{confirmed: boolean, img: string, id}} 確かめられなければ confirmed: false（id は Deezer のアーティスト ID）
  */
 export function pickDeezerByTracks(searches, names) {
     const lists = searches.map((s) => deezerTrackCandidates(s.results, { titles: s.titles, names }));
     for (const list of lists) {
-        for (const c of list.values()) if (c.titleMatch && c.nameMatch) return { confirmed: true, img: c.picture };
+        for (const c of list.values()) if (c.titleMatch && c.nameMatch) return { confirmed: true, img: c.picture, id: c.id };
     }
     if (lists.length >= 2) {
         for (const [id, c] of lists[0]) {
@@ -219,11 +222,98 @@ export function pickDeezerByTracks(searches, names) {
             if (others.some((o) => !o)) continue;
             const all = [c, ...others];
             if (all.some((x) => x.nameMatch) || all.some((x) => x.titleMatch)) {
-                return { confirmed: true, img: all.map((x) => x.picture).find(Boolean) || '' };
+                return { confirmed: true, img: all.map((x) => x.picture).find(Boolean) || '', id };
             }
         }
     }
-    return { confirmed: false, img: '' };
+    return { confirmed: false, img: '', id: null };
+}
+
+// --- Wikidata（Wikimedia Commons の写真） ---
+
+// Wikidata の写真の取得方法の版
+export const WIKIDATA_VERSION = 1;
+
+/** Wikidata で照合に使うキー（照合済みの Apple と Deezer のアーティスト ID）。どちらもなければ '' */
+export function wikidataKeyOf(entry) {
+    const apple = entry && entry.it && entry.it.v === ITUNES_VERSION && entry.it.id ? String(entry.it.id) : '';
+    const deezer = entry && entry.imgV === IMAGE_VERSION && entry.dzId ? String(entry.dzId) : '';
+    return apple || deezer ? `${apple}/${deezer}` : '';
+}
+
+/** Wikidata の写真をまだ調べていないか（ID が変わった、または 30 日たった） */
+export function needsWikidata(entry, now = Date.now()) {
+    const key = wikidataKeyOf(entry);
+    if (!key) return false;
+    const wd = entry.wd;
+    return !wd || wd.v !== WIKIDATA_VERSION || wd.key !== key || now - (wd.at || 0) > RETRY_MS;
+}
+
+/** 表示に使う Wikidata の写真（{img, page, author, license, licenseUrl}）。なければ null */
+export function wikidataImageOf(entry) {
+    const wd = entry && entry.wd;
+    return wd && wd.v === WIKIDATA_VERSION && wd.img && wd.key === wikidataKeyOf(entry) ? wd : null;
+}
+
+/** Apple（P2850）と Deezer（P2722）のアーティスト ID から、写真（P18）をまとめて引く SPARQL */
+export function wikidataQuery(appleIds, deezerIds) {
+    const vals = (xs) => xs.map(String).filter((x) => /^\d+$/.test(x)).map((x) => `"${x}"`).join(' ');
+    const parts = [];
+    if (vals(appleIds)) parts.push(`{ VALUES ?apple { ${vals(appleIds)} } ?item wdt:P2850 ?apple . }`);
+    if (vals(deezerIds)) parts.push(`{ VALUES ?deezer { ${vals(deezerIds)} } ?item wdt:P2722 ?deezer . }`);
+    return parts.length ? `SELECT ?apple ?deezer ?image WHERE { ${parts.join(' UNION ')} ?item wdt:P18 ?image . }` : '';
+}
+
+/** SPARQL の結果を、ID ごとの Commons のファイル名にする */
+export function parseWikidataImages(json) {
+    const apple = new Map();
+    const deezer = new Map();
+    for (const b of json?.results?.bindings || []) {
+        const file = commonsFileName(b.image?.value);
+        if (!file) continue;
+        if (b.apple && !apple.has(b.apple.value)) apple.set(b.apple.value, file);
+        if (b.deezer && !deezer.has(b.deezer.value)) deezer.set(b.deezer.value, file);
+    }
+    return { apple, deezer };
+}
+
+/** Special:FilePath の URL からファイル名を取り出し、Commons の表記（空白区切り）にそろえる */
+export function commonsFileName(url) {
+    if (!url) return '';
+    let name = String(url).split('/').pop();
+    try { name = decodeURIComponent(name); } catch { /* そのまま使う */ }
+    name = name.replace(/_/g, ' ').trim();
+    return name ? name[0].toUpperCase() + name.slice(1) : '';
+}
+
+/** HTML（作者名などに含まれるリンク）を文字だけにする */
+export function stripHtml(s) {
+    const text = String(s || '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+        .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+        .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return text.length > 80 ? `${text.slice(0, 79)}…` : text;
+}
+
+/** Commons の imageinfo の結果を、ファイル名ごとの写真の情報にする */
+export function parseCommonsInfo(json) {
+    const out = new Map();
+    for (const p of Object.values(json?.query?.pages || {})) {
+        const ii = p && p.imageinfo && p.imageinfo[0];
+        if (!ii || !/^https:\/\//.test(ii.thumburl || '')) continue;
+        const m = ii.extmetadata || {};
+        out.set(commonsFileName(String(p.title).replace(/^File:/, '')), {
+            img: ii.thumburl,
+            page: /^https?:\/\//.test(ii.descriptionurl || '') ? ii.descriptionurl : '',
+            author: stripHtml(m.Artist?.value) || '不明',
+            license: stripHtml(m.LicenseShortName?.value),
+            licenseUrl: /^https?:\/\//.test(m.LicenseUrl?.value || '') ? m.LicenseUrl.value : '',
+        });
+    }
+    return out;
 }
 
 /** 検索に使う表記を選ぶ（Deezer は英語・ローマ字の表記でよく見つかるため、英字だけの表記を優先する） */
@@ -290,6 +380,42 @@ export function itunesSearch(term) {
 /** アーティスト名で、そのアーティストの曲の一覧を取得する（同じ名前の別のアーティストも含まれる） */
 export function itunesArtistSongs(name) {
     return itunesQuery({ term: name, entity: 'song', attribute: 'artistTerm', limit: '200' });
+}
+
+/** Wikidata の SPARQL で写真のファイル名を引く */
+export async function wikidataImages(appleIds, deezerIds) {
+    const query = wikidataQuery(appleIds, deezerIds);
+    if (!query) return { apple: new Map(), deezer: new Map() };
+    let res;
+    try {
+        res = await fetch('https://query.wikidata.org/sparql', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ query, format: 'json' }),
+        });
+    } catch {
+        throw Object.assign(new Error('network'), { temp: true });
+    }
+    if (res.status === 429) throw Object.assign(new Error('rate'), { rate: true });
+    if (!res.ok) throw Object.assign(new Error(`wikidata ${res.status}`), { temp: true });
+    return parseWikidataImages(await res.json());
+}
+
+/** Wikimedia Commons から、写真の縮小版・作者・ライセンスを 50 件まで取得する */
+export async function commonsInfo(files) {
+    const url = `https://commons.wikimedia.org/w/api.php?${new URLSearchParams({
+        action: 'query', titles: files.map((f) => `File:${f}`).join('|'), prop: 'imageinfo', iiprop: 'url|extmetadata', iiurlwidth: '500',
+        iiextmetadatafilter: 'Artist|LicenseShortName|LicenseUrl', format: 'json', origin: '*',
+    })}`;
+    let res;
+    try {
+        res = await fetch(url);
+    } catch {
+        throw Object.assign(new Error('network'), { temp: true });
+    }
+    if (res.status === 429) throw Object.assign(new Error('rate'), { rate: true });
+    if (!res.ok) throw Object.assign(new Error(`commons ${res.status}`), { temp: true });
+    return parseCommonsInfo(await res.json());
 }
 
 let jsonpSeq = 0;

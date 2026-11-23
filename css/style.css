@@ -584,6 +584,12 @@ mark { background: rgba(237, 161, 0, 0.35); color: inherit; border-radius: 3px; 
 .detail__kind { font-size: 12px; font-weight: 700; color: var(--accent); }
 .detail__title { font-size: 20px; line-height: 1.35; overflow-wrap: anywhere; }
 .detail__aka { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.detail__photo img { display: block; width: 100%; max-height: 240px; object-fit: cover; object-position: center 25%; border-radius: var(--radius-sm); background: var(--surface-2); }
+.detail__photo figcaption { margin-top: 6px; font-size: 11.5px; color: var(--muted); overflow-wrap: anywhere; }
+.detail__photo a, .credits a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.credits { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.credits__name { color: var(--text-2); font-weight: 600; margin-right: 6px; }
+.credits__note { margin-top: 8px; font-size: 12px; color: var(--muted); }
 .detail__head .icon-btn { align-self: flex-start; }
 .detail__body { padding: 16px 18px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 12px; }
 .detail__period { font-size: 12.5px; color: var(--muted); }

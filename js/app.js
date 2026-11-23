@@ -5,7 +5,7 @@ import { icon } from './icons.js';
 import { parseFile } from './parser.js';
 import { emptyDataset, mergeEntries, buildBackup } from './dataset.js';
 import { buildModel, defaultSettings, normalizeSettings, artistKeyOf, resolveAlias, findMergeCandidates } from './model.js';
-import { emptyMeta, normalizeMeta, needsFetch, needsImage, needsItunesArtist, RETRY_MS, ITUNES_VERSION, JA_RE, ASCII_RE, nameKey, songKey, ytVideos, ytOembed, itunesSearch, itunesArtistSongs, deezerTrackSearch, deezerTrackCandidates, pickDeezerByTracks, searchTermOf, IMAGE_VERSION, pickItunes, pickItunesArtist, itunesArtistGroups, summarizeItunesArtist, findItunesArtistByTrack, runPool, sleep } from './enrich.js';
+import { emptyMeta, normalizeMeta, needsFetch, needsImage, needsItunesArtist, RETRY_MS, ITUNES_VERSION, JA_RE, ASCII_RE, nameKey, songKey, ytVideos, ytOembed, itunesSearch, itunesArtistSongs, deezerTrackSearch, deezerTrackCandidates, pickDeezerByTracks, searchTermOf, IMAGE_VERSION, WIKIDATA_VERSION, wikidataKeyOf, needsWikidata, wikidataImages, commonsInfo, pickItunes, pickItunesArtist, itunesArtistGroups, summarizeItunesArtist, findItunesArtistByTrack, runPool, sleep } from './enrich.js';
 import { computeStats, computeRanks, computeHighlights, parsePeriod, encodePeriod, periodRange, previousRange, trackDetail, artistDetail, dayDetail } from './stats.js';
 import { getValue, setValues, clearAll, readLegacyEntries } from './store.js';
 import * as V from './views.js';
@@ -418,9 +418,12 @@ async function enrich() {
     try {
         await enrichTitles(stop);
         if (!stop()) await enrichArtists(stop);
+        if (!stop()) await enrichWikidata(stop);
         if (!stop()) await enrichItunes(stop);
         // iTunes で日本語の名前や曲名が分かり、画像を確かめられなかったアーティストをもう一度探す
         if (!stop()) await enrichArtists(stop);
+        // iTunes で Apple のアーティスト ID が分かったアーティストの写真を Wikidata で探す
+        if (!stop()) await enrichWikidata(stop);
     } catch (err) {
         console.error(err);
     } finally {
@@ -705,7 +708,7 @@ async function enrichArtists(stop) {
                 }
                 if (pick.confirmed) break;
             }
-            meta.artists[a.key] = { ...(meta.artists[a.key] || {}), img: pick.img, imgAt: Date.now(), imgV: IMAGE_VERSION };
+            meta.artists[a.key] = { ...(meta.artists[a.key] || {}), img: pick.img, imgAt: Date.now(), imgV: IMAGE_VERSION, dzId: pick.id };
         } catch {
             // 通信の失敗は記録せず、次に開いたときにもう一度探す
         }
@@ -720,6 +723,55 @@ async function enrichArtists(stop) {
     }, stop);
     saveMeta();
     refreshFromMeta();
+}
+
+/**
+ * Wikidata に登録されているアーティストの写真（Wikimedia Commons）を探す。
+ * 照合済みの Apple・Deezer のアーティスト ID で引くので、同じ名前の別のアーティストにはならない。
+ * 写真の作者とライセンスも取得し、詳細画面などに表示する
+ */
+async function enrichWikidata(stop) {
+    const model = state.model;
+    const meta = state.extMeta;
+    const started = Date.now();
+    const items = model.artists.filter((a) => a.key !== 'a:?' && needsWikidata(meta.artists[a.key], started));
+    if (!items.length) return;
+
+    state.enrich = { label: 'アーティスト写真', done: 0, total: items.length };
+    setEnrichStatus();
+    try {
+        // Wikidata の SPARQL は 150 組ずつ、Commons は 50 ファイルずつまとめて問い合わせる
+        for (let i = 0; i < items.length && !stop(); i += 150) {
+            const batch = items.map((a) => ({ a, e: meta.artists[a.key] })).slice(i, i + 150).map((x) => ({
+                ...x,
+                key: wikidataKeyOf(x.e),
+                apple: x.e.it && x.e.it.v === ITUNES_VERSION && x.e.it.id ? String(x.e.it.id) : '',
+                deezer: x.e.imgV === IMAGE_VERSION && x.e.dzId ? String(x.e.dzId) : '',
+            }));
+            const found = await wikidataImages(batch.map((x) => x.apple).filter(Boolean), batch.map((x) => x.deezer).filter(Boolean));
+            await sleep(1000);
+            // Apple の ID で見つかったものを優先する
+            for (const x of batch) x.file = (x.apple && found.apple.get(x.apple)) || (x.deezer && found.deezer.get(x.deezer)) || '';
+            const files = [...new Set(batch.map((x) => x.file).filter(Boolean))];
+            const info = new Map();
+            for (let k = 0; k < files.length && !stop(); k += 50) {
+                for (const [f, v] of await commonsInfo(files.slice(k, k + 50))) info.set(f, v);
+                await sleep(1000);
+            }
+            if (stop()) break;
+            for (const x of batch) {
+                const v = x.file ? info.get(x.file) : null;
+                x.e.wd = { v: WIKIDATA_VERSION, key: x.key, img: v ? v.img : '', ...(v ? { page: v.page, author: v.author, license: v.license, licenseUrl: v.licenseUrl } : {}), at: Date.now() };
+            }
+            state.enrich.done += batch.length;
+            setEnrichStatus();
+            saveMeta();
+            refreshFromMeta();
+        }
+    } catch (err) {
+        if (!err.rate && !err.temp) throw err;
+        // 回数制限や通信の失敗。続きは次に開いたときに行う
+    }
 }
 
 // --- ファイルの読み込み ---
@@ -1174,7 +1226,10 @@ function onClick(e) {
         case 'retry-meta':
             // 取れなかったものの記録を消して、もう一度問い合わせる
             for (const [k, v] of Object.entries(state.extMeta.tracks)) if (v.src === 'none') delete state.extMeta.tracks[k];
-            for (const v of Object.values(state.extMeta.artists)) if (!v.img) { delete v.img; delete v.imgAt; delete v.imgV; }
+            for (const v of Object.values(state.extMeta.artists)) {
+                if (!v.img) { delete v.img; delete v.imgAt; delete v.imgV; }
+                if (v.wd && !v.wd.img) delete v.wd;
+            }
             saveMeta().then(() => enrich());
             toast('取得できなかったものを、もう一度問い合わせます。');
             break;
