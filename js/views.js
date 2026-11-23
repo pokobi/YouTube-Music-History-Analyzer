@@ -575,6 +575,11 @@ export function dataView(state) {
                     : html`<span class="status">${icon('alert')} 保存データは保護されていません。容量が足りなくなると、ブラウザに消されることがあります。</span>
                         <button type="button" class="btn btn--small" data-action="persist">保護を有効にする</button>`}
             </div>
+            <details class="howto howto--plain">
+                <summary>再生履歴の書き出し方（Google Takeout）</summary>
+                ${takeoutSteps('「ファイルを追加」から読み込むか、画面にドロップする')}
+                <p class="howto__note">新しく書き出したファイルは、前回と期間が重なっていてもそのまま追加できます。読み込み済みの記録と同じものは除かれます。</p>
+            </details>
         `, { actions: html`<button type="button" class="btn btn--primary" data-action="add-files">${icon('plus')}<span>ファイルを追加</span></button>` })}
 
         ${card('読み込み履歴', imports.length ? html`
@@ -700,6 +705,19 @@ export function dataView(state) {
 
 // --- 最初の画面 ---
 
+/** Google Takeout で再生履歴を書き出す手順。last は最後の手順（読み込み方） */
+function takeoutSteps(last) {
+    return html`
+        <ol>
+            <li><a href="https://takeout.google.com/" target="_blank" rel="noopener noreferrer">Google Takeout ${icon('external')}</a> を開き、「選択をすべて解除」を押す。</li>
+            <li>「YouTube と YouTube Music」にチェックを入れる。</li>
+            <li>「YouTube のすべてのデータが含まれます」を押し、「履歴」だけを選んで OK を押す。</li>
+            <li>「複数の形式」を押し、履歴の形式を「JSON」にする。</li>
+            <li>「次のステップ」→「エクスポートを作成」を押す。</li>
+            <li>届いた ZIP をそのまま、または中の <code>watch-history.json</code> を${last}。</li>
+        </ol>`;
+}
+
 export function welcomeView() {
     return html`
         <section class="welcome">
@@ -714,14 +732,7 @@ export function welcomeView() {
             </button>
             <details class="howto" open>
                 <summary>再生履歴の書き出し方（Google Takeout）</summary>
-                <ol>
-                    <li><a href="https://takeout.google.com/" target="_blank" rel="noopener noreferrer">Google Takeout ${icon('external')}</a> を開き、「選択をすべて解除」を押す。</li>
-                    <li>「YouTube と YouTube Music」にチェックを入れる。</li>
-                    <li>「YouTube のすべてのデータが含まれます」を押し、「履歴」だけを選んで OK を押す。</li>
-                    <li>「複数の形式」を押し、履歴の形式を「JSON」にする。</li>
-                    <li>「次のステップ」→「エクスポートを作成」を押す。</li>
-                    <li>届いた ZIP をそのまま、または中の <code>watch-history.json</code> をここに読み込む。</li>
-                </ol>
+                ${takeoutSteps('ここに読み込む')}
             </details>
             <ul class="notes">
                 <li>記録されているのは再生を始めた日時だけです。再生時間は次の再生までの間隔から推定しています。</li>
